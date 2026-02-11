@@ -1,3 +1,4 @@
+#+vet explicit-allocators
 package main
 
 import "core:fmt"
@@ -35,116 +36,35 @@ main :: proc () {
         reader.host_and_port = host_and_port
         reader.socket = client
         
-        request_data: [dynamic] u8
-        for {
-            line, done, read_error := socket_read_line(&reader)
-            
-            append_string(&request_data, line)
-            
-            if read_error != nil do break
-            if done do break
-        }
-        
-        parse_request(to_string(request_data[:]))
-        
-        fmt.printf("\n------------------------------\nConnection closed with %v and source %v\n", client, client_source)
-        reader_reset(&reader)
-        
         r: HttpRequest
-        r = parse_request("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n")
+        r = parse_from_socket(&reader)
+        
+        fmt.printf("------------------------------\nConnection closed with %v and source %v\n", client, client_source)
+        
+        r = parse_from_string("GET / HTTP/1.1\r\n\r\n")
         assert(r.valid)
-        r = parse_request("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n")
+        
+        r = parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n")
+        assert(r.valid)
+        r = parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n")
         assert(r.valid)
         
-        r = parse_request("Invalid // HTTP/1.1\r\n")
+        r = parse_from_string("Invalid // HTTP/1.1\r\n")
         assert(!r.valid)
-        r = parse_request("get / HTTP/1.1\r\n")
+        r = parse_from_string("get / HTTP/1.1\r\n")
+        assert(!r.valid)
+        r = parse_from_string("GET / HTTP/add.0\r\n")
+        assert(!r.valid)
+        r = parse_from_string("GET  /  HTTP/1.1\r\n\r\n")
+        assert(!r.valid)
+        r = parse_from_string("/ GET HTTP/1.1\r\n")
         assert(!r.valid)
         
-        r = parse_request("GET / HTTP/add.0\r\n")
-        assert(!r.valid)
-        
-        r = parse_request("/ GET HTTP/1.1\r\n")
-        assert(!r.valid)
-        
-        r = parse_request("GE")
+        r = parse_from_string("GE")
         assert(!r.valid)
         
         fmt.println("All tests passed")
     }
-}
-
-////////////////////////////////////////////////
-HttpRequest :: struct {
-    valid: bool,
-    
-    method:         string,
-    request_target: string,
-    http_version:   string,
-    
-    headers: [dynamic] Header,
-    body: string,
-}
-
-Header :: struct {
-    key:   string,
-    value: string,
-}
-
-parse_request :: proc (data: string) -> HttpRequest {
-    result: HttpRequest
-    result.headers = make([dynamic] Header)
-    result.valid = true
-    
-    data := data
-    {
-        request_line := chop_until_rn(&data)
-        
-        // @todo(viktor): technically multiple spaces should be an invalid request
-        result.method         = trim(chop_until_space(&request_line))
-        result.request_target = trim(chop_until_space(&request_line))
-        result.http_version   = trim(chop_until_space(&request_line))
-        
-        result.valid &&= is_valid_method(result)
-        // @todo(viktor): validate request_target
-        result.valid &&= is_valid_http_version(result)
-    }
-    
-    for {
-        header := chop_until_rn(&data)
-        if header == "" do break
-        
-        key := chop_until(&header, ':')
-        value := trim(header)
-        append(&result.headers, Header{ key, value })
-    }
-    
-    result.body = data
-    
-    return result
-}
-
-is_valid_method :: proc (request: HttpRequest) -> bool {
-    result := request.method == "GET" || request.method == "POST"
-    return result
-}
-
-is_valid_http_version :: proc (request: HttpRequest) -> bool {
-    version := request.http_version
-    http := chop_until(&version, '/')
-    
-    result: bool
-    if http == "HTTP" {
-        major := chop_until(&version, '.')
-        minor := version
-        if major == "1" {
-            if minor == "0" || minor == "1" {
-                result = true
-            }
-        }
-    }
-    
-    return result
 }
 
 ////////////////////////////////////////////////
@@ -200,6 +120,17 @@ chop_until_rn :: proc (data: ^string) -> (string, bool) #optional_ok {
     return result, ok
 }
 
+find_rn :: proc (data: string) -> bool {
+    result: bool
+    for index in 0..<len(data)-1 {
+        if data[index] == '\r' && data[index+1] == '\n' {
+            result = true
+            break
+        }
+    }
+    return result
+}
+
 ////////////////////////////////////////////////
 
 trim :: proc (data: string) -> string {
@@ -243,50 +174,155 @@ to_bytes :: proc (data: string) -> [] u8 {
 SocketReadContext :: struct {
     host_and_port: string,
     socket: net.TCP_Socket,
-    buf: [8] u8,
-    line: [dynamic] u8,
     
+    buf: [8] u8,
     index: int,
     read_amount: int,
+    
+    read_error: net.TCP_Recv_Error,
 }
 
-reader_reset :: proc (reader: ^SocketReadContext) {
-    clear(&reader.line)
-    reader^ = { line = reader.line }
-}
+Read_Result :: enum { CanBeContinued, Done, ShouldClose }
 
-socket_read_line :: proc (reader: ^SocketReadContext) -> (string, bool, net.TCP_Recv_Error) {
+////////////////////////////////////////////////
+
+// @compress the copy loop is also similar and should be compressable. @speed that would also avoid appending each byte one by one
+socket_read_line :: proc (reader: ^SocketReadContext, destination: ^[dynamic] u8) -> Read_Result {
     for {
-        read_error: net.TCP_Recv_Error
-        if reader.index == reader.read_amount {
-            reader.read_amount, read_error = net.recv_tcp(reader.socket, reader.buf[:])
-            reader.index = 0
-        }
+        begin_socket_read(reader)
         
-        result: string
-        copy: for ; reader.index < reader.read_amount; reader.index += 1 {
-            append(&reader.line, reader.buf[reader.index])
-            if reader.buf[reader.index] == '\n' {
-                result = transmute(string) reader.line[:]
-                reader.index += 1
-                clear(&reader.line)
+        read_done: bool
+        copy: for reader.index < reader.read_amount {
+            it := reader.buf[reader.index]
+            reader.index += 1
+            
+            append(destination, it)
+            if it == '\n' {
+                read_done = true
                 break copy
             }
         }
         
-        if read_error == .Connection_Closed || reader.read_amount == 0 {
-            result = transmute(string) reader.line[:]
-            return result, true, read_error
-        } else if read_error != nil {
-            fmt.printf("ERROR: Could not read from socket '%v': %v\n", reader.host_and_port, read_error)
-            result = transmute(string) reader.line[:]
-            return result, true, read_error
+        continue_reading, read_result := end_socket_read(reader, read_done)
+        if !continue_reading do return read_result
+    }
+}
+
+socket_read_count :: proc (reader: ^SocketReadContext, destination: ^[dynamic] u8, count: int, cursor: ^int) -> Read_Result {
+    assert(count <= len(reader.buf))
+    for {
+        begin_socket_read(reader)
+        
+        read_done: bool
+        copy: for reader.index < reader.read_amount {
+            it := reader.buf[reader.index]
+            reader.index += 1
+            cursor^ += 1
+            
+            append(destination, it)
+            if cursor^ == count {
+                read_done = true
+                cursor^ = 0
+                break copy
+            }
         }
         
-        if result != "" {
-            return result, false, nil
-        }
+        continue_reading, read_result := end_socket_read(reader, read_done)
+        if !continue_reading do return read_result
     }
+}
+
+socket_read_rn:: proc (reader: ^SocketReadContext, destination: ^[dynamic] u8) -> Read_Result {
+    for {
+        begin_socket_read(reader)
+        
+        read_done: bool
+        copy: for reader.index < reader.read_amount {
+            it := reader.buf[reader.index]
+            reader.index += 1
+            
+            append(destination, it)
+            if len(destination) > 1 && destination[len(destination)-2] == '\r' && destination[len(destination)-1] == '\n' {
+                read_done = true
+                break copy
+            }
+        }
+        
+        continue_reading, read_result := end_socket_read(reader, read_done)
+        if !continue_reading do return read_result
+    }
+}
+
+socket_read_all :: proc (reader: ^SocketReadContext, destination: ^[dynamic] u8) -> Read_Result {
+    for {
+        begin_socket_read(reader)
+        
+        append_elems(destination, ..reader.buf[reader.index:reader.read_amount])
+        reader.index = reader.read_amount
+        
+        continue_reading, read_result := end_socket_read(reader, false)
+        if !continue_reading do return read_result
+    }
+}
+
+////////////////////////////////////////////////
+
+begin_socket_read :: proc (reader: ^SocketReadContext) {
+    if reader.index == reader.read_amount {
+        reader.read_amount, reader.read_error = net.recv_tcp(reader.socket, reader.buf[:])
+        reader.index = 0
+    }
+}
+
+end_socket_read :: proc (reader: ^SocketReadContext, pause_reading: bool) -> (bool, Read_Result) {
+    continue_reading: bool
+    result: Read_Result
+    if reader.read_amount == 0 || reader.read_error == .Connection_Closed {
+        result = .Done
+    } else if reader.read_error != nil {
+        fmt.printf("ERROR: Could not read from socket '%v': %v\n", reader.host_and_port, reader.read_error)
+        result = .ShouldClose
+    } else if pause_reading {
+        result = .CanBeContinued
+    } else {
+        continue_reading = true
+    }
+    
+    return continue_reading, result
+}
+
+////////////////////////////////////////////////
+
+StringReadContext :: struct {
+    data: string,
+    index: int,
+}
+
+string_read_rn:: proc (reader: ^StringReadContext, destination: ^[dynamic] u8) -> Read_Result {
+    for {
+        read_done: bool
+        copy: for reader.index < len(reader.data) {
+            it := reader.data[reader.index]
+            reader.index += 1
+            
+            append(destination, it)
+            if len(destination) > 1 && destination[len(destination)-2] == '\r' && destination[len(destination)-1] == '\n' {
+                read_done = true
+                break copy
+            }
+        }
+        
+        if reader.index == len(reader.data) do return .Done
+        if read_done do return .CanBeContinued 
+    }
+}
+
+string_read_all :: proc (reader: ^StringReadContext, destination: ^[dynamic] u8) -> Read_Result {
+    left := reader.data[reader.index:]
+    append_string(destination, left)
+    reader.index = len(left)
+    
+    return .Done
 }
 
 ////////////////////////////////////////////////
