@@ -1,6 +1,7 @@
 package main
 
 import "core:strings"
+import "core:strconv"
 
 HttpRequest :: struct {
     valid: bool,
@@ -15,19 +16,19 @@ HttpRequest :: struct {
 
 ////////////////////////////////////////////////
 
-parse_from_socket :: proc (reader: ^SocketReadContext) -> HttpRequest {
+request_parse_from_socket :: proc (reader: ^SocketReadContext) -> HttpRequest {
     reader.buffer = make_byte_buffer(reader._backing[:])
-    return parse(reader, socket_read_until, socket_read_all)
+    return request_parse(reader, socket_read_until, socket_read_count)
 }
 
-parse_from_string :: proc (data: string) -> HttpRequest {
+request_parse_from_string :: proc (data: string) -> HttpRequest {
     reader: StringReadContext
     reader.buffer = make_byte_buffer(to_bytes(data))
     reader.buffer.write_cursor = len(data)
-    return parse(&reader, string_read_until, string_read_all)
+    return request_parse(&reader, string_read_until, string_read_count)
 }
 
-parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_Result, $read_all: proc (^T, ^Byte_Buffer) -> Read_Result) -> HttpRequest {
+request_parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_Result, $read_count: proc (^T, ^Byte_Buffer, int) -> Read_Result) -> HttpRequest {
     result: HttpRequest
     result.headers = make(map[string] string, context.allocator)
     
@@ -42,6 +43,7 @@ parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_
         
         // @todo(viktor): validate request_target
         if is_valid_method(result) && is_valid_http_version(result) {
+            do_body: bool
             loop: for read_until(reader, &buffer, "\r\n") != .ShouldClose {
                 header_line := buffer_read_all_string(&buffer)
                 
@@ -56,11 +58,32 @@ parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_
                         break loop
                     }
                 } else {
-                    if read_all(reader, &buffer) != .ShouldClose{
-                        result.body = buffer_read_all_string(&buffer)
-                        result.valid = true
-                    }
+                    do_body = true
                     break loop
+                }
+            }
+            
+            if do_body {
+                
+                reported_content_length_string, key_ok := header_get_lower(&result.headers, "content-length")
+                reported_content_length: int
+                
+                content_ok: bool
+                actual_content: string
+                if key_ok {
+                    parse_ok: bool
+                    reported_content_length, parse_ok = strconv.parse_int(reported_content_length_string)
+                }
+                
+                read_result := read_count(reader, &buffer, reported_content_length)
+                if read_result == .Done {
+                    actual_content = buffer_read_all_string(&buffer)
+                    content_ok = len(actual_content) == reported_content_length
+                }
+                
+                if content_ok {
+                    result.body = actual_content
+                    result.valid = true
                 }
             }
         }
@@ -85,6 +108,11 @@ header_set :: proc (headers: ^map[string] string, key, value: string, allocator:
 
 header_get :: proc (headers: ^map[string] string, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
     key_lower := strings.to_lower(key, allocator)
+    result, ok := header_get_lower(headers, key_lower)
+    return result, ok
+}
+header_get_lower :: proc (headers: ^map[string] string, key_lower: string) -> (string, bool) #optional_ok {
+    // @todo(viktor): internal only, assert that its lower
     result, ok := headers[key_lower]
     return result, ok
 }

@@ -37,30 +37,37 @@ main :: proc () {
         reader.socket = client
         
         r: HttpRequest
-        r = parse_from_socket(&reader)
+        r = request_parse_from_socket(&reader)
         
         fmt.printf("------------------------------\nConnection closed with %v and source %v\n", client, client_source)
         
-        r = parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(r.valid)
         
-        r = parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n"); assert(r.valid)
-        r = parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\nThis is a body\r\n"); assert(r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nHost: localhost:6969\r\n\r\n"); assert(r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\nhost: localhost:42069\r\nHOST: localhost:6969\r\n\r\n"); assert(r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\nHost`: localhost:42069\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nHost: localhost:6969\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nhost: localhost:42069\r\nHOST: localhost:6969\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost`: localhost:42069\r\n\r\n"); assert(r.valid)
         
-        r = parse_from_string("GET / HTTP/1.1\r\nHost : localhost:42069\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\nHost:"); assert(!r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\n\r\nKey: Value"); assert(r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\nHost´: localhost:42069\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("GET / HTTP/1.1\r\n     Host:               localhost:42069            \r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost : localhost:42069\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost:"); assert(!r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\n\r\nKey: Value"); assert(!r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\nHost´: localhost:42069\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("GET / HTTP/1.1\r\n     Host:               localhost:42069            \r\n\r\n"); assert(r.valid)
         
-        r = parse_from_string("Invalid // HTTP/1.1\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("get / HTTP/1.1\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("GET / HTTP/add.0\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("GET  /  HTTP/1.1\r\n\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("/ GET HTTP/1.1\r\n\r\n"); assert(!r.valid)
-        r = parse_from_string("GE"); assert(!r.valid)
+        r = request_parse_from_string("Invalid // HTTP/1.1\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("get / HTTP/1.1\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("GET / HTTP/add.0\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("GET  /  HTTP/1.1\r\n\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("/ GET HTTP/1.1\r\n\r\n"); assert(!r.valid)
+        r = request_parse_from_string("GE"); assert(!r.valid)
+        
+        r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\nA stray body"); assert(!r.valid)
+        r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 0\r\n\r\n"); assert(r.valid)
+        r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 13\r\n\r\nhello world!\n"); assert(r.valid)
+        r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 20\r\n\r\npartial content"); assert(!r.valid)
+        
         
         fmt.println("All tests passed")
     }
@@ -195,6 +202,17 @@ socket_read_until :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer
     }
 }
 
+socket_read_count :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer, count: int) -> Read_Result {
+    for {
+        begin_socket_read(reader)
+        
+        read_done := _read_count_middle(destination, &reader.buffer, count)
+        
+        continue_reading, read_result := end_socket_read(reader, read_done)
+        if !continue_reading do return read_result
+    }
+}
+
 socket_read_all :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer) -> Read_Result {
     for {
         begin_socket_read(reader)
@@ -248,6 +266,14 @@ string_read_until:: proc (reader: ^StringReadContext, buffer: ^Byte_Buffer, endi
     }
 }
 
+string_read_count :: proc (reader: ^StringReadContext, buffer: ^Byte_Buffer, count: int) -> Read_Result {
+    for {
+        read_done := _read_count_middle(buffer, &reader.buffer, count)
+        
+        if !buffer_can_read(&reader.buffer) do return .Done
+        if read_done do return .CanBeContinued 
+    }
+}
 string_read_all :: proc (reader: ^StringReadContext, buffer: ^Byte_Buffer) -> Read_Result {
     _read_all_middle(buffer, &reader.buffer)
     return .Done
@@ -262,6 +288,25 @@ _read_ending_middle :: proc (destination, source: ^Byte_Buffer, ending: string) 
         
         buffer_write(destination, it)
         if ends_with(buffer_peek_all_string(destination), ending) {
+            read_done = true
+            break copy
+        }
+    }
+    
+    return read_done
+}
+
+_read_count_middle :: proc (destination, source: ^Byte_Buffer, count: int) -> bool {
+    // @todo(viktor): handle this nicer in the loop
+    if count == 0 do return true
+    
+    read_done: bool
+    start := destination.write_cursor
+    copy: for buffer_can_read(source) {
+        it := buffer_read(source, u8)^
+        
+        buffer_write(destination, it)
+        if destination.write_cursor - start == count {
             read_done = true
             break copy
         }
