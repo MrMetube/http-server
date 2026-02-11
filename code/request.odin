@@ -1,5 +1,7 @@
 package main
 
+import "core:strings"
+
 HttpRequest :: struct {
     valid: bool,
     
@@ -7,34 +9,32 @@ HttpRequest :: struct {
     request_target: string,
     http_version:   string,
     
-    headers: [dynamic] Header,
+    headers: map[string] string,
     body: string,
-}
-
-Header :: struct {
-    key:   string,
-    value: string,
 }
 
 ////////////////////////////////////////////////
 
 parse_from_socket :: proc (reader: ^SocketReadContext) -> HttpRequest {
-    return parse(reader, socket_read_rn, socket_read_all)
+    reader.buffer = make_byte_buffer(reader._backing[:])
+    return parse(reader, socket_read_until, socket_read_all)
 }
 
 parse_from_string :: proc (data: string) -> HttpRequest {
-    reader := StringReadContext { data = data }
-    return parse(&reader, string_read_rn, string_read_all)
+    reader: StringReadContext
+    reader.buffer = make_byte_buffer(to_bytes(data))
+    reader.buffer.write_cursor = len(data)
+    return parse(&reader, string_read_until, string_read_all)
 }
 
-parse :: proc (reader: ^$T, $read_rn, $read_all: proc (^T, ^[dynamic] u8) -> Read_Result) -> HttpRequest {
+parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_Result, $read_all: proc (^T, ^Byte_Buffer) -> Read_Result) -> HttpRequest {
     result: HttpRequest
-    result.headers = make([dynamic] Header, context.allocator)
+    result.headers = make(map[string] string, context.allocator)
     
-    received := make([dynamic] u8, context.allocator)
-    if read_rn(reader, &received) != .ShouldClose {
-        request_line := to_string(received[:])
-        read_cursor := len(request_line)
+    buffer:= make_byte_buffer(make([] u8, 1024, context.allocator))
+    
+    if read_until(reader, &buffer, "\r\n") != .ShouldClose {
+        request_line := buffer_read_all_string(&buffer)
         
         result.method         = chop_until_space(&request_line)
         result.request_target = chop_until_space(&request_line)
@@ -42,18 +42,22 @@ parse :: proc (reader: ^$T, $read_rn, $read_all: proc (^T, ^[dynamic] u8) -> Rea
         
         // @todo(viktor): validate request_target
         if is_valid_method(result) && is_valid_http_version(result) {
-            loop: for read_rn(reader, &received) != .ShouldClose {
-                header_line := to_string(received[read_cursor:])
-                read_cursor += len(header_line)
+            loop: for read_until(reader, &buffer, "\r\n") != .ShouldClose {
+                header_line := buffer_read_all_string(&buffer)
                 
                 if header_line != "\r\n" {
-                    header: Header
-                    header.key   = chop_until(&header_line, ':')
-                    header.value = trim(header_line)
-                    append(&result.headers, header)
+                    header_line = trim(header_line)
+                    
+                    key := chop_until(&header_line, ':')
+                    if is_valid_header_key(key) {
+                        value := trim(header_line)
+                        header_set(&result.headers, key, value, context.allocator)
+                    } else {
+                        break loop
+                    }
                 } else {
-                    if read_all(reader, &received) != .ShouldClose{
-                        result.body = to_string(received[read_cursor:])
+                    if read_all(reader, &buffer) != .ShouldClose{
+                        result.body = buffer_read_all_string(&buffer)
                         result.valid = true
                     }
                     break loop
@@ -63,6 +67,26 @@ parse :: proc (reader: ^$T, $read_rn, $read_all: proc (^T, ^[dynamic] u8) -> Rea
     }
     
     return result
+}
+
+////////////////////////////////////////////////
+
+header_set :: proc (headers: ^map[string] string, key, value: string, allocator: Allocator) {
+    // @todo(viktor): also check for a valid key?
+    key_lower := strings.to_lower(key, allocator)
+    _, value_pointer, just_inserted, _ := map_entry(headers, key_lower)
+    if !just_inserted {
+        new_value, _ := strings.concatenate({value_pointer^, ", ", value}, context.allocator)
+        value_pointer^ = new_value
+    } else {
+        value_pointer^ = value
+    }
+}
+
+header_get :: proc (headers: ^map[string] string, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
+    key_lower := strings.to_lower(key, allocator)
+    result, ok := headers[key_lower]
+    return result, ok
 }
 
 ////////////////////////////////////////////////
@@ -88,4 +112,40 @@ is_valid_http_version :: proc (request: HttpRequest) -> bool {
     }
     
     return result
+}
+
+is_valid_header_key :: proc (header_key: string)  -> bool {
+    valid_header_characters := [max(u8)] bool {
+        '!'  = true,
+        '#'  = true,
+        '$'  = true,
+        '%'  = true,
+        '&'  = true,
+        '\'' = true,
+        '*'  = true,
+        '+'  = true,
+        '-'  = true,
+        '.'  = true,
+        '^'  = true,
+        '_'  = true,
+        '`'  = true,
+        '|'  = true,
+        '~'  = true,
+        
+         0  ..=  9  = true,
+        'a' ..= 'z' = true,
+        'A' ..= 'Z' = true,
+    }
+    
+    for r in header_key {
+        if !valid_header_characters[r] {
+            return false
+        }
+    }
+    
+    if len(header_key) != 0 {
+        return true
+    } else {
+        return false
+    }
 }
