@@ -26,6 +26,11 @@ buffer_write_reserve :: proc (b: ^Byte_Buffer, $T: typeid) -> (result: ^T) {
     return result
 }
 
+buffer_write_full_buffer :: proc (b: ^Byte_Buffer, source: ^Byte_Buffer) {
+    ss := buffer_read_all(source)
+    buffer_write_slice(b, ss)
+}
+
 buffer_write_slice :: proc (b: ^Byte_Buffer, values: [] $T) {
     dest   := b.bytes[b.write_cursor:]
     source := slice_from_parts(u8, raw_data(values), len(values) * size_of(T))

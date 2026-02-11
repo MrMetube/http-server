@@ -1,5 +1,6 @@
 package main
 
+import "core:fmt"
 import "core:strings"
 import "core:strconv"
 
@@ -176,4 +177,37 @@ is_valid_header_key :: proc (header_key: string)  -> bool {
     } else {
         return false
     }
+}
+
+test_request_parsing :: proc () {
+    r: HttpRequest
+    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(r.valid)
+    
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nHost: localhost:6969\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nhost: localhost:42069\r\nHOST: localhost:6969\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost`: localhost:42069\r\n\r\n"); assert(r.valid)
+    
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost : localhost:42069\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost:"); assert(!r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\nKey: Value"); assert(!r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost´: localhost:42069\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\n     Host:               localhost:42069            \r\n\r\n"); assert(r.valid)
+    
+    r = request_parse_from_string("Invalid // HTTP/1.1\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("get / HTTP/1.1\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("GET / HTTP/add.0\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("GET  /  HTTP/1.1\r\n\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("/ GET HTTP/1.1\r\n\r\n"); assert(!r.valid)
+    r = request_parse_from_string("GE"); assert(!r.valid)
+    
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\nA stray body"); assert(!r.valid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 0\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 13\r\n\r\nhello world!\n"); assert(r.valid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 20\r\n\r\npartial content"); assert(!r.valid)
+    
+    
+    fmt.println("All tests passed")
 }
