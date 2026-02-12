@@ -10,18 +10,10 @@ ResponceCode :: enum {
     Internal_Server_Error = 500,
 }
 
-Default_Headers :: struct {
-    content_length: int,
-    connection: string,
-    content_type: string,
-}
-
-get_default_headers :: proc (content_length: int) -> Default_Headers {
-    result: Default_Headers
-    result.connection = "close"
-    result.content_type = "text/plain"
-    result.content_length = content_length
-    return result
+get_default_headers :: proc (headers: ^Headers, content_length: int) {
+    header_set_lower(headers, "connection", "close")
+    header_set_lower(headers, "content-type", "text/plain")
+    header_set_lower(headers, "content-length", fmt.tprintf("%v", content_length))
 }
 
 write_response_line :: proc (sb: ^strings.Builder, code: ResponceCode) {
@@ -36,10 +28,10 @@ write_response_line :: proc (sb: ^strings.Builder, code: ResponceCode) {
     fmt.sbprintf(sb, "HTTP/1.1 %v %v\r\n", cast(int) code, reason_phrase)
 }
 
-write_headers :: proc (sb: ^strings.Builder, default: Default_Headers) {
-    fmt.sbprintf(sb, "Content-Length: %v\r\n", default.content_length)
-    fmt.sbprintf(sb, "Content-Type: %v\r\n", default.content_type)
-    fmt.sbprintf(sb, "Connection: %v\r\n", default.connection)
+write_headers :: proc (sb: ^strings.Builder, headers: ^Headers) {
+    fmt.sbprintf(sb, "Content-Length: %v\r\n", header_get_lower(headers, "content-length"))
+    fmt.sbprintf(sb, "Content-Type: %v\r\n",   header_get_lower(headers, "content-type"))
+    fmt.sbprintf(sb, "Connection: %v\r\n",     header_get_lower(headers, "connection"))
 }
 
 write_body :: proc (sb: ^strings.Builder, body: string) {

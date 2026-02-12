@@ -2,6 +2,11 @@ package main
 
 import "base:runtime"
 
+Gigabyte :: 1024 * Megabyte
+Megabyte :: 1024 * Kilobyte
+Kilobyte :: 1024 * Byte
+Byte     :: 1
+
 pmm :: rawptr
 umm :: uintptr
 
