@@ -8,7 +8,7 @@ Request :: struct {
     invalid: bool,
     
     allocator: Allocator   "fmt:\"-\"",
-    backing:   Byte_Buffer "fmt:\"-\"", // the request data is copied into here
+    buffer:    Byte_Buffer "fmt:\"-\"", // the request data is copied into here
     headers:   Headers,     // header keys are reallocated to ensure lowercase, values are views into the backing buffer
     
     // these strings are views into the backing buffer
@@ -26,16 +26,22 @@ Headers :: struct {
     internal: map[string] string,
 }
 
+Response ::struct {
+    code:    ResponceCode,
+    headers: Headers,
+    content: string,
+}
+
 ////////////////////////////////////////////////
 
 request_init :: proc (result: ^Request, allocator: Allocator) {
     result.allocator = allocator
     result.headers = make_headers(result.allocator)
-    result.backing = make_byte_buffer(make([] u8, 1024, result.allocator))
+    result.buffer = make_byte_buffer(make([] u8, 1024, result.allocator))
 }
 
 request_parse_from_socket :: proc (result: ^Request, upto: Request_Section, reader: ^SocketReadContext) {
-    request_parse(result, upto, reader, socket_read_until, socket_read_count, socket_read_done)
+    request_parse(result, upto, reader)
 }
 
 // @note(viktor): this is only here for testing
@@ -46,22 +52,20 @@ request_parse_from_string :: proc (data: string) -> Request{
     reader.buffer.write_cursor = len(data)
     request_init(&result, context.temp_allocator)
     
-    request_parse(&result, .request_line, &reader, string_read_until, string_read_count, string_read_done)
-    request_parse(&result, .headers,      &reader, string_read_until, string_read_count, string_read_done)
-    request_parse(&result, .body,         &reader, string_read_until, string_read_count, string_read_done)
+    request_parse(&result, .request_line, &reader)
+    request_parse(&result, .headers,      &reader)
+    request_parse(&result, .body,         &reader)
     
     return result
 }
 
-request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> bool, $read_count: proc (^T, ^Byte_Buffer, int) -> bool, $read_done: proc(^T) -> bool) {
+request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     assert(request.allocator != {}, "Request was not initialized")
-    
-    // @todo(viktor): only upto
     
     // Requestline
     if !request.invalid && request.done_upto < .request_line && .request_line <= upto {
-        if read_until(reader, &request.backing, "\r\n") {
-            request_line := buffer_read_all_string(&request.backing)
+        if read_until(reader, &request.buffer, "\r\n") {
+            request_line := buffer_read_all_string(&request.buffer)
             
             request.method         = chop_until_space(&request_line)
             request.request_target = chop_until_space(&request_line)
@@ -80,8 +84,8 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $r
     
     // Headers
     if !request.invalid && request.done_upto < .headers && .headers <= upto {
-        loop: for read_until(reader, &request.backing, "\r\n") {
-            header_line := buffer_read_all_string(&request.backing)
+        loop: for read_until(reader, &request.buffer, "\r\n") {
+            header_line := buffer_read_all_string(&request.buffer)
             
             if header_line != "\r\n" {
                 header_line = trim(header_line)
@@ -89,7 +93,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $r
                 key := chop_until(&header_line, ':')
                 if is_valid_header_key(key) {
                     value := trim(header_line)
-                    header_set(&request.headers, key, value, request.allocator)
+                    headers_set(&request.headers, key, value, request.allocator)
                 } else {
                     request.invalid = true
                     break loop
@@ -105,7 +109,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $r
     // Body
     if !request.invalid && request.done_upto < .body && .body <= upto {
         // @todo(viktor): helper header_get_int?
-        reported_content_length_string, exists := header_get_lower(&request.headers, "content-length")
+        reported_content_length_string, exists := headers_get_lower(&request.headers, "content-length")
         reported_content_length: int
         
         content_ok: bool
@@ -115,8 +119,8 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $r
             reported_content_length, parse_ok = strconv.parse_int(reported_content_length_string)
         }
         
-        if read_count(reader, &request.backing, reported_content_length) && read_done(reader) {
-            actual_content = buffer_read_all_string(&request.backing)
+        if read_count(reader, &request.buffer, reported_content_length) && read_done(reader) {
+            actual_content = buffer_read_all_string(&request.buffer)
             
             if reported_content_length == len(actual_content) {
                 request.body = actual_content
@@ -143,20 +147,18 @@ make_headers :: proc (allocator: Allocator) -> Headers {
 }
 
 // @todo(viktor): both set and get also check for a valid key?
-header_set :: proc (headers: ^Headers, key, value: string, allocator: Allocator) {
+headers_set :: proc (headers: ^Headers, key, value: string, allocator: Allocator) {
     key_lower := strings.to_lower(key, allocator)
-    header_set_lower(headers, key_lower, value)
+    headers_set_lower(headers, key_lower, value)
 }
-
-header_get :: proc (headers: ^Headers, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
+headers_get :: proc (headers: ^Headers, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
     key_lower := strings.to_lower(key, allocator)
-    result, ok := header_get_lower(headers, key_lower)
+    result, ok := headers_get_lower(headers, key_lower)
     return result, ok
 }
 
-
 // @todo(viktor): both set and get internal only, assert that its lower and valid
-header_set_lower :: proc (headers: ^Headers, key_lower, value: string) {
+headers_set_lower :: proc (headers: ^Headers, key_lower, value: string) {
     _, value_pointer, just_inserted, _ := map_entry(&headers.internal, key_lower)
     if !just_inserted {
         new_value, _ := strings.concatenate({value_pointer^, ", ", value}, context.allocator)
@@ -165,8 +167,10 @@ header_set_lower :: proc (headers: ^Headers, key_lower, value: string) {
         value_pointer^ = value
     }
 }
-
-header_get_lower :: proc (headers: ^Headers, key_lower: string) -> (string, bool) #optional_ok {
+headers_unset_lower :: proc (headers: ^Headers, key_lower: string) {
+    delete_key(&headers.internal, key_lower)
+}
+headers_get_lower :: proc (headers: ^Headers, key_lower: string) -> (string, bool) #optional_ok {
     result, ok := headers.internal[key_lower]
     return result, ok
 }

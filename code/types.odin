@@ -74,6 +74,11 @@ buffer_read :: proc (b: ^Byte_Buffer, $T: typeid) -> (result: ^T) {
     result = cast(^T) &data[0]
     return result
 }
+buffer_read_value :: proc (b: ^Byte_Buffer, $T: typeid) -> (result: T) {
+    data := buffer_read_amount(b, size_of(T))
+    result = (cast(^T) &data[0])^
+    return result
+}
 
 buffer_read_all :: proc (b: ^Byte_Buffer) -> (result: [] u8) {
     result = buffer_read_amount(b, b.write_cursor - b.read_cursor)
@@ -110,6 +115,13 @@ buffer_read_slice :: proc (b: ^Byte_Buffer, $T: typeid/ [] $E, count: int) -> (r
 buffer_begin_reading :: proc (b: ^Byte_Buffer) { b.read_cursor = 0 }
 buffer_can_read :: proc (b: ^Byte_Buffer) -> (result: bool) { return b.read_cursor < b.write_cursor }
 
+buffer_foo :: proc (b: ^Byte_Buffer) {
+    unread := b.bytes[b.read_cursor:b.write_cursor]
+    copy(b.bytes[0:len(unread)], unread)
+    
+    b.write_cursor -= b.read_cursor
+    b.read_cursor   = 0
+}
 clear_byte_buffer :: proc (b: ^Byte_Buffer) {
     b.read_cursor = 0
     b.write_cursor = 0
