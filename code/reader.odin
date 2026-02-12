@@ -12,6 +12,13 @@ SocketReadContext :: struct {
     read_error: net.TCP_Recv_Error,
 }
 
+socket_reader_make :: proc (client: net.TCP_Socket) -> SocketReadContext {
+    result: SocketReadContext
+    result.buffer = make_byte_buffer(result._backing[:])
+    result.socket = client
+    return result
+}
+
 ////////////////////////////////////////////////
 
 socket_read_until :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer, ending: string) -> bool {

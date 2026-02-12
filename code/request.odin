@@ -5,7 +5,7 @@ import "core:strings"
 import "core:strconv"
 
 Request :: struct {
-    valid: bool,
+    invalid: bool,
     
     allocator: Allocator   "fmt:\"-\"",
     backing:   Byte_Buffer "fmt:\"-\"", // the request data is copied into here
@@ -16,7 +16,11 @@ Request :: struct {
     request_target: string,
     http_version:   string,
     body:           string,
+    
+    done_upto: Request_Section,
 }
+
+Request_Section :: enum u8 { none, request_line, headers, body }
 
 Headers :: struct {
     internal: map[string] string,
@@ -30,9 +34,8 @@ request_init :: proc (result: ^Request, allocator: Allocator) {
     result.backing = make_byte_buffer(make([] u8, 1024, result.allocator))
 }
 
-request_parse_from_socket :: proc (result: ^Request, reader: ^SocketReadContext, allocator: Allocator) {
-    reader.buffer = make_byte_buffer(reader._backing[:])
-    request_parse(result, reader, allocator, socket_read_until, socket_read_count, socket_read_done)
+request_parse_from_socket :: proc (result: ^Request, upto: Request_Section, reader: ^SocketReadContext) {
+    request_parse(result, upto, reader, socket_read_until, socket_read_count, socket_read_done)
 }
 
 // @note(viktor): this is only here for testing
@@ -41,20 +44,22 @@ request_parse_from_string :: proc (data: string) -> Request{
     reader: StringReadContext
     reader.buffer = make_byte_buffer(to_bytes(data))
     reader.buffer.write_cursor = len(data)
-    request_parse(&result, &reader, context.temp_allocator, string_read_until, string_read_count, string_read_done)
+    request_init(&result, context.temp_allocator)
+    
+    request_parse(&result, .request_line, &reader, string_read_until, string_read_count, string_read_done)
+    request_parse(&result, .headers,      &reader, string_read_until, string_read_count, string_read_done)
+    request_parse(&result, .body,         &reader, string_read_until, string_read_count, string_read_done)
+    
     return result
 }
 
-request_parse :: proc (request: ^Request, reader: ^$T, allocator: Allocator, $read_until: proc(^T, ^Byte_Buffer, string) -> bool, $read_count: proc (^T, ^Byte_Buffer, int) -> bool, $read_done: proc(^T) -> bool) {
-    do_request_line, do_headers, do_body: bool
-    
-    request_init(request, allocator)
+request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> bool, $read_count: proc (^T, ^Byte_Buffer, int) -> bool, $read_done: proc(^T) -> bool) {
     assert(request.allocator != {}, "Request was not initialized")
     
-    do_request_line = true
+    // @todo(viktor): only upto
     
     // Requestline
-    if do_request_line {
+    if !request.invalid && request.done_upto < .request_line && .request_line <= upto {
         if read_until(reader, &request.backing, "\r\n") {
             request_line := buffer_read_all_string(&request.backing)
             
@@ -64,13 +69,17 @@ request_parse :: proc (request: ^Request, reader: ^$T, allocator: Allocator, $re
             
             // @todo(viktor): validate request_target
             if is_valid_method(request) && is_valid_http_version(request) {
-                do_headers = true
+                 request.done_upto = .request_line
+            } else {
+                request.invalid = true
             }
+        } else {
+            request.invalid = true
         }
     }
     
     // Headers
-    if do_headers {
+    if !request.invalid && request.done_upto < .headers && .headers <= upto {
         loop: for read_until(reader, &request.backing, "\r\n") {
             header_line := buffer_read_all_string(&request.backing)
             
@@ -82,38 +91,46 @@ request_parse :: proc (request: ^Request, reader: ^$T, allocator: Allocator, $re
                     value := trim(header_line)
                     header_set(&request.headers, key, value, request.allocator)
                 } else {
+                    request.invalid = true
                     break loop
                 }
             } else {
-                do_body = true
                 break loop
             }
         }
+        
+        request.done_upto = .headers
     }
     
     // Body
-    if do_body {
-        reported_content_length_string, key_ok := header_get_lower(&request.headers, "content-length")
+    if !request.invalid && request.done_upto < .body && .body <= upto {
+        // @todo(viktor): helper header_get_int?
+        reported_content_length_string, exists := header_get_lower(&request.headers, "content-length")
         reported_content_length: int
         
         content_ok: bool
         actual_content: string
-        if key_ok {
+        if exists {
             parse_ok: bool
             reported_content_length, parse_ok = strconv.parse_int(reported_content_length_string)
         }
         
-        read_ok := read_count(reader, &request.backing, reported_content_length)
-        if read_ok && read_done(reader) {
+        if read_count(reader, &request.backing, reported_content_length) && read_done(reader) {
             actual_content = buffer_read_all_string(&request.backing)
-            content_ok = len(actual_content) == reported_content_length
+            
+            if reported_content_length == len(actual_content) {
+                request.body = actual_content
+            } else {
+                request.invalid = true
+            }
+        } else {
+            request.invalid = true
         }
         
-        if content_ok {
-            request.body = actual_content
-            request.valid = true
-        }
+        request.done_upto = .body
     }
+    
+    // @todo(viktor): trailers
 }
 
 ////////////////////////////////////////////////
@@ -217,32 +234,32 @@ is_valid_header_key :: proc (header_key: string)  -> bool {
 
 test_request_parsing :: proc () {
     r: Request
-    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(!r.invalid)
     
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nHost: localhost:6969\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\nhost: localhost:42069\r\nHOST: localhost:6969\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost`: localhost:42069\r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("POST /help/me/escape HTTP/1.0\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nHost: localhost:6969\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nhost: localhost:42069\r\nHOST: localhost:6969\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost`: localhost:42069\r\n\r\n"); assert(!r.invalid)
     
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost : localhost:42069\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost:"); assert(!r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\nKey: Value"); assert(!r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\nHost´: localhost:42069\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("GET / HTTP/1.1\r\n     Host:               localhost:42069            \r\n\r\n"); assert(r.valid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost : localhost:42069\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost:"); assert(r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\n\r\nKey: Value"); assert(r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\nHost´: localhost:42069\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("GET / HTTP/1.1\r\n     Host:               localhost:42069            \r\n\r\n"); assert(!r.invalid)
     
-    r = request_parse_from_string("Invalid // HTTP/1.1\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("get / HTTP/1.1\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("GET / HTTP/add.0\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("GET  /  HTTP/1.1\r\n\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("/ GET HTTP/1.1\r\n\r\n"); assert(!r.valid)
-    r = request_parse_from_string("GE"); assert(!r.valid)
+    r = request_parse_from_string("Invalid // HTTP/1.1\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("get / HTTP/1.1\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("GET / HTTP/add.0\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("GET  /  HTTP/1.1\r\n\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("/ GET HTTP/1.1\r\n\r\n"); assert(r.invalid)
+    r = request_parse_from_string("GE"); assert(r.invalid)
     
-    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\nA stray body"); assert(!r.valid)
-    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 0\r\n\r\n"); assert(r.valid)
-    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 13\r\n\r\nhello world!\n"); assert(r.valid)
-    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 20\r\n\r\npartial content"); assert(!r.valid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\n\r\nA stray body"); assert(r.invalid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 0\r\n\r\n"); assert(!r.invalid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 13\r\n\r\nhello world!\n"); assert(!r.invalid)
+    r = request_parse_from_string("POST /submit HTTP/1.1\r\nContent-Length: 20\r\n\r\npartial content"); assert(r.invalid)
     
     
     fmt.println("All tests passed")

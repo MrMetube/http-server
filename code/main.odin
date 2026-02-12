@@ -31,10 +31,11 @@ main :: proc () {
             if accept_error == nil {
                 fmt.printf("Connection accepted by %v with source %v\n", client, client_source)
                 
-                reader := SocketReadContext { socket = client }
-                // @todo(viktor): make flags to parse (request-line) (request-line, headers) (request-line, body)
+                reader := socket_reader_make(client)
                 r: Request
-                request_parse_from_socket(&r, &reader, request_allocator)
+                request_init(&r, request_allocator)
+                // @todo(viktor): just do upto .request_line and let handler so the rest, or let handler specify this
+                request_parse_from_socket(&r, .body, &reader)
                 fmt.printf("Received:\n%v\n", r)
                 
                 sb := strings.builder_make(request_allocator)
@@ -95,7 +96,7 @@ main :: proc () {
                 
                 net.send_tcp(client, sb.buf[:])
                 
-                test_request_parsing()
+                // test_request_parsing()
                 
                 fmt.printf("Connection closed with %v and source %v\n", client, client_source)
             } else {
