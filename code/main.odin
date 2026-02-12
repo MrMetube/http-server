@@ -4,6 +4,7 @@ package main
 import "core:fmt"
 import os "core:os/os2"
 import "core:net"
+import "core:strings"
 
 Server :: struct {
     valid: bool,
@@ -17,6 +18,7 @@ main :: proc () {
     
     if server.valid {
         for {
+            // @todo(viktor): handle multiple connections
             client, client_source, accept_error := net.accept_tcp(server.socket)
             if accept_error != nil {
                 end, _ := net.bound_endpoint(server.socket)
@@ -26,14 +28,37 @@ main :: proc () {
             
             fmt.printf("Connection accepted by %v with source %v\n", client, client_source)
             
-            reader: SocketReadContext
-            reader.socket = client
-            
+            reader := SocketReadContext { socket = client }
+            // @todo(viktor): make flags to parse (request-line) (request-line, headers) (request-line, body)
             r := request_parse_from_socket(&reader)
+            fmt.printf("Received:\n%v\n", r)
             
-            fmt.printf("------------------------------\nConnection closed with %v and source %v\n", client, client_source)
+            sb := strings.builder_make(context.temp_allocator)
             
-            test_request_parsing()
+            content: string
+            code: ResponceCode
+            headers: Headers
+            
+            switch r.request_target {
+            case "/yourproblem":
+                content = "Your problem is not my problem\n"
+                code = .Bad_Request
+            case "/myproblem":
+                content = "Woopsie, my bad\n"
+                code = .Internal_Server_Error
+            case:
+                content = "All good, frfr\n"
+                code = .OK
+            }
+            
+            write_response_line(&sb, code)
+            write_headers(&sb, get_default_headers(len(content)))
+            write_body(&sb, content)
+            
+            net.send_tcp(client, sb.buf[:])
+            
+            fmt.printf("Connection closed with %v and source %v\n", client, client_source)
+            net.close(client)
         }
     }
 }

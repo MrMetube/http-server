@@ -4,34 +4,35 @@ import "core:fmt"
 import "core:strings"
 import "core:strconv"
 
-HttpRequest :: struct {
+Request :: struct {
     valid: bool,
     
     method:         string,
     request_target: string,
     http_version:   string,
     
-    headers: map[string] string,
+    headers: Headers,
     body: string,
 }
 
+Headers :: map[string] string
 ////////////////////////////////////////////////
 
-request_parse_from_socket :: proc (reader: ^SocketReadContext) -> HttpRequest {
+request_parse_from_socket :: proc (reader: ^SocketReadContext) -> Request {
     reader.buffer = make_byte_buffer(reader._backing[:])
-    return request_parse(reader, socket_read_until, socket_read_count)
+    return request_parse(reader, socket_read_until, socket_read_count, socket_read_done)
 }
 
-request_parse_from_string :: proc (data: string) -> HttpRequest {
+request_parse_from_string :: proc (data: string) -> Request {
     reader: StringReadContext
     reader.buffer = make_byte_buffer(to_bytes(data))
     reader.buffer.write_cursor = len(data)
-    return request_parse(&reader, string_read_until, string_read_count)
+    return request_parse(&reader, string_read_until, string_read_count, string_read_done)
 }
 
-request_parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_Result, $read_count: proc (^T, ^Byte_Buffer, int) -> Read_Result) -> HttpRequest {
-    result: HttpRequest
-    result.headers = make(map[string] string, context.allocator)
+request_parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) -> Read_Result, $read_count: proc (^T, ^Byte_Buffer, int) -> Read_Result, $read_done: proc(^T) -> bool) -> Request {
+    result: Request
+    result.headers = make(Headers, context.allocator)
     
     buffer:= make_byte_buffer(make([] u8, 1024, context.allocator))
     
@@ -77,7 +78,7 @@ request_parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) 
                 }
                 
                 read_result := read_count(reader, &buffer, reported_content_length)
-                if read_result == .Done {
+                if read_done(reader) {
                     actual_content = buffer_read_all_string(&buffer)
                     content_ok = len(actual_content) == reported_content_length
                 }
@@ -95,7 +96,7 @@ request_parse :: proc (reader: ^$T, $read_until: proc(^T, ^Byte_Buffer, string) 
 
 ////////////////////////////////////////////////
 
-header_set :: proc (headers: ^map[string] string, key, value: string, allocator: Allocator) {
+header_set :: proc (headers: ^Headers, key, value: string, allocator: Allocator) {
     // @todo(viktor): also check for a valid key?
     key_lower := strings.to_lower(key, allocator)
     _, value_pointer, just_inserted, _ := map_entry(headers, key_lower)
@@ -107,12 +108,12 @@ header_set :: proc (headers: ^map[string] string, key, value: string, allocator:
     }
 }
 
-header_get :: proc (headers: ^map[string] string, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
+header_get :: proc (headers: ^Headers, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
     key_lower := strings.to_lower(key, allocator)
     result, ok := header_get_lower(headers, key_lower)
     return result, ok
 }
-header_get_lower :: proc (headers: ^map[string] string, key_lower: string) -> (string, bool) #optional_ok {
+header_get_lower :: proc (headers: ^Headers, key_lower: string) -> (string, bool) #optional_ok {
     // @todo(viktor): internal only, assert that its lower
     result, ok := headers[key_lower]
     return result, ok
@@ -120,12 +121,12 @@ header_get_lower :: proc (headers: ^map[string] string, key_lower: string) -> (s
 
 ////////////////////////////////////////////////
 
-is_valid_method :: proc (request: HttpRequest) -> bool {
+is_valid_method :: proc (request: Request) -> bool {
     result := request.method == "GET" || request.method == "POST"
     return result
 }
 
-is_valid_http_version :: proc (request: HttpRequest) -> bool {
+is_valid_http_version :: proc (request: Request) -> bool {
     version := request.http_version
     http := chop_until(&version, '/')
     
@@ -180,7 +181,7 @@ is_valid_header_key :: proc (header_key: string)  -> bool {
 }
 
 test_request_parsing :: proc () {
-    r: HttpRequest
+    r: Request
     r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(r.valid)
     
     r = request_parse_from_string("GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"); assert(r.valid)

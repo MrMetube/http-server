@@ -8,10 +8,11 @@ SocketReadContext :: struct {
     
     _backing: [8] u8,
     buffer: Byte_Buffer,
-    
+
     read_error: net.TCP_Recv_Error,
 }
 
+// @todo(viktor): currently only strings know when its done, and we only ever ask with the function for done, so kinda stupid
 Read_Result :: enum { CanBeContinued, Done, ShouldClose }
 
 ////////////////////////////////////////////////
@@ -29,7 +30,7 @@ socket_read_until :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer
 
 socket_read_count :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer, count: int) -> Read_Result {
     for {
-        begin_socket_read(reader)
+        begin_socket_read(reader, count)
         
         read_done := _read_count_middle(destination, &reader.buffer, count)
         
@@ -49,11 +50,27 @@ socket_read_all :: proc (reader: ^SocketReadContext, destination: ^Byte_Buffer) 
     }
 }
 
+socket_read_done :: proc(reader: ^SocketReadContext) -> bool {
+    null: [0] u8
+    read: int
+    read, reader.read_error = net.recv_tcp(reader.socket, null[:])
+    
+    result: bool
+    if read == 0 && reader.read_error == nil {
+        result = reader.buffer.read_cursor == reader.buffer.write_cursor
+    } else {
+        // @todo(viktor): handle the error
+    }
+    return result
+}
+
 ////////////////////////////////////////////////
 
-begin_socket_read :: proc (reader: ^SocketReadContext) {
+begin_socket_read :: proc (reader: ^SocketReadContext, at_most := len(reader._backing)) {
     if !buffer_can_read(&reader.buffer) {
-        reader.buffer.write_cursor, reader.read_error = net.recv_tcp(reader.socket, reader._backing[:])
+        read: int
+        read, reader.read_error = net.recv_tcp(reader.socket, reader._backing[:min(len(reader._backing), at_most)])
+        reader.buffer.write_cursor = read
         reader.buffer.read_cursor = 0
     }
 }
@@ -61,9 +78,7 @@ begin_socket_read :: proc (reader: ^SocketReadContext) {
 end_socket_read :: proc (reader: ^SocketReadContext, pause_reading: bool) -> (bool, Read_Result) {
     continue_reading: bool
     result: Read_Result
-    if reader.buffer.write_cursor == 0 || reader.read_error == .Connection_Closed {
-        result = .Done
-    } else if reader.read_error != nil {
+    if reader.read_error != nil {
         end, _ := net.bound_endpoint(reader.socket)
         fmt.printf("ERROR: Could not read from socket '%v': %v\n", net.endpoint_to_string(end, context.temp_allocator), reader.read_error)
         result = .ShouldClose
@@ -100,9 +115,14 @@ string_read_count :: proc (reader: ^StringReadContext, buffer: ^Byte_Buffer, cou
         if read_done do return .CanBeContinued 
     }
 }
+
 string_read_all :: proc (reader: ^StringReadContext, buffer: ^Byte_Buffer) -> Read_Result {
     buffer_write_full_buffer(buffer, &reader.buffer)
     return .Done
+}
+
+string_read_done :: proc(reader: ^StringReadContext) -> bool {
+    return reader.buffer.read_cursor == reader.buffer.write_cursor
 }
 
 ////////////////////////////////////////////////
