@@ -1,6 +1,7 @@
 package main
 
 import "base:runtime"
+import "core:fmt"
 
 Gigabyte :: 1024 * Megabyte
 Megabyte :: 1024 * Kilobyte
@@ -133,4 +134,20 @@ to_string :: proc (data: [] u8) -> string {
 }
 to_bytes :: proc (data: string) -> [] u8 {
     return transmute([] u8) data
+}
+
+@(disabled=ODIN_DISABLE_ASSERT)
+assert :: proc (condition: $B, message := #caller_expression(condition), loc := #caller_location, prefix:= "Assertion failed") {
+    if !condition {
+        fmt.printf("%v %v", loc, prefix)
+        if len(message) > 0 {
+            fmt.printf(": %v\n", message)
+        }
+        
+        when ODIN_DEBUG {
+             runtime.debug_trap()
+        } else {
+            runtime.trap()
+        }
+    }
 }

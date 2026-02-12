@@ -5,7 +5,7 @@ import "core:strings"
 import code ".."
 
 main :: proc () {
-    once(2)
+    once(3)
 }
 
 once :: proc (kind: int) {

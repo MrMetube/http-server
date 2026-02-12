@@ -19,7 +19,7 @@ main :: proc () {
     defer end_server(server)
     
     if server.valid {
-        request_backing := make([] u8, 512 * Megabyte, context.allocator)
+        request_backing := make([] u8, 1 * Gigabyte, context.allocator)
         request_arena: mem.Arena
         mem.arena_init(&request_arena, request_backing)
         request_allocator := mem.arena_allocator(&request_arena)
@@ -32,12 +32,12 @@ main :: proc () {
             if accept_error == nil {
                 fmt.printf("Connection accepted by %v with source %v\n", client, client_source)
                 
-                reader := socket_reader_make(client)
+                reader := socket_reader_make(client, make([]u8, 8, request_allocator))
                 r: Request
                 request_init(&r, request_allocator)
                 // @todo(viktor): just do upto .request_line and let handler so the rest, or let handler specify this
                 request_parse_from_socket(&r, .body, &reader)
-                fmt.printf("Received:\n%v\n", r)
+                fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", r.method, r.request_target, r.http_version, r.headers, r.body)
                 
                 sb := strings.builder_make(request_allocator)
                 
@@ -64,50 +64,63 @@ main :: proc () {
                     write_response_line(&sb, response.code)
                     write_headers(&sb, &response.headers)
                     
-                    net.send_tcp(client, sb.buf[:])
+                    send(client, strings.to_string(sb))
                     
-                    httpbin_reader := socket_reader_make(httpbin)
+                    httpbin_reader := socket_reader_make(httpbin, make([] u8, 256, request_allocator))
+                    copy_buffer := make_byte_buffer(make([] u8, 64, request_allocator))
                     
-                    _buffer: [32] u8
-                    buffer := make_byte_buffer(_buffer[:])
-                    
-                    if !read_until(&httpbin_reader, &buffer, "\r\n") {
+                    if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
                         // @incomplete handle read error
                     }
-                    response_line := buffer_read_all_string(&buffer)
-                    fmt.printf("Received %v\n", response_line)
-                    
-                    done := read_done(&httpbin_reader)
+                    _ = buffer_read_all_string(&copy_buffer) // response_line
                     
                     for {
-                        buffer_foo(&buffer)
-                        if !read_until(&httpbin_reader, &buffer, "\r\n") {
+                        buffer_foo(&copy_buffer)
+                        if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
                             // @incomplete handle read error
                         }
-                        header := buffer_read_all_string(&buffer)
+                        header := buffer_read_all_string(&copy_buffer)
                         if header == "\r\n" do break
-                        fmt.printf("header=%v\n", header)
                     }
                     
+                    send(client, "\r\n")
+                    
                     for {
-                        buffer_foo(&buffer)
-                        if !read_until(&httpbin_reader, &buffer, "\r\n") {
+                        buffer_foo(&copy_buffer)
+                        if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
                             // @incomplete handle read error
                         }
-                        length_string := buffer_read_all_string(&buffer)
+                        length_string := buffer_read_all_string(&copy_buffer)
                         
-                        length, ok := strconv.parse_int(length_string)
+                        length_string = trim(length_string)
+                        length, ok := strconv.parse_int(length_string, base = 16)
                         if !ok {
                             // @incomplete handle parse error
                         }
                         
-                        buffer_foo(&buffer)
-                        if !read_count(&httpbin_reader, &buffer, length) {
+                        re_length_string := fmt.aprintf("%x\r\n", length, allocator = request_allocator)
+                        send(client, re_length_string)
+                        
+                        buffer_foo(&copy_buffer)
+                        // @todo(viktor): this structure is exactly the same as inside read_count. though bool is a pleasent return value, we need to be able to indicate errrors on read AND errors/no space left to write into 
+                        // @correctness, all these reads should be a loop IF and only if the size of the read COULD exceed the copy_buffers size, which is true for these chunks
+                        remaining := length + len("\r\n")
+                        for !read_count(&copy_buffer, &httpbin_reader, remaining) {
                             // @incomplete handle read error
+                            content := buffer_read_all_string(&copy_buffer)
+                            send(client, content)
+                            buffer_foo(&copy_buffer)
+                            remaining -= len(content)
                         }
-                        content := buffer_read_all_string(&buffer)
-                        fmt.printf("content=%v\n", len(content))
+                        
+                        content := buffer_read_all_string(&copy_buffer)
+                        send(client, content)
+                        
+                        if length == 0 && content == "\r\n" do break
                     }
+                    
+                    send(client, "\r\n")
+                    
                     net.close(httpbin)
                     net.close(client)
                     
@@ -117,7 +130,7 @@ main :: proc () {
                     respond_and_close(client, client_source, &sb, &response)
                 }
                 
-                // test_request_parsing()
+                test_request_parsing()
                 
             } else {
                 end, _ := net.bound_endpoint(server.socket)

@@ -3,61 +3,74 @@ package main
 import "core:fmt"
 import "core:net"
 
-SocketReadContext :: struct {
+SocketReadContext :: struct  {
+    buffer: Byte_Buffer,
     socket: net.TCP_Socket,
-    
-    backing: [8] u8,
-    buffer:   Byte_Buffer,
-
-    read_error: net.TCP_Recv_Error,
 }
 
 StringReadContext :: struct {
-    backing: string,
-    buffer:  Byte_Buffer,
+    buffer: Byte_Buffer,
+    source: string,
 }
 
-socket_reader_make :: proc (client: net.TCP_Socket) -> SocketReadContext {
+socket_reader_make :: proc (client: net.TCP_Socket, buffer: []u8) -> SocketReadContext {
     result: SocketReadContext
-    result.buffer = make_byte_buffer(result.backing[:])
+    result.buffer = make_byte_buffer(buffer)
     result.socket = client
+    
     return result
 }
 
 ////////////////////////////////////////////////
 
-begin_socket_read :: proc (reader: ^SocketReadContext, at_most := len(reader.backing)) {
+reader_receive :: proc (reader: ^SocketReadContext, at_most := max(int)) -> bool {
+    ok := true
     if !buffer_can_read(&reader.buffer) {
-        wants_to_read := min(len(reader.backing), at_most)
+        wanted_read := min(len(reader.buffer.bytes), at_most)
+        actual_read, read_error := net.recv_tcp(reader.socket, reader.buffer.bytes[:wanted_read])
         
-        reader.buffer.write_cursor, reader.read_error = net.recv_tcp(reader.socket, reader.buffer.bytes[:wants_to_read])
-        reader.buffer.read_cursor = 0
-    }
-}
-
-end_socket_read :: proc (reader: ^SocketReadContext) -> bool {
-    ok := reader.read_error == nil
-    if !ok {
-        end, _ := net.bound_endpoint(reader.socket)
-        fmt.printf("ERROR: Could not read from socket '%v': %v\n", net.endpoint_to_string(end, context.temp_allocator), reader.read_error)
+        reader.buffer.write_cursor = actual_read
+        reader.buffer.read_cursor  = 0
+        
+        if read_error != nil {
+            ok = false
+            fmt.printf("ERROR: Could not read from socket '%v': %v\n", address_and_port_from_socket(reader.socket), read_error)
+        }
     }
     
     return ok
 }
 
 ////////////////////////////////////////////////
+// @naming if it werent for the I/O it would be more of a copy than a read
 
-// @todo(viktor): fix the loops, for !read_done
-read_until :: proc (reader: ^$T, destination: ^Byte_Buffer, ending: string) -> bool {
+// @todo(viktor): can we remove the read-byte-write-byte loop like we did for read_count?
+read_until :: proc { read_until_string, read_until_socket }
+read_until_socket :: proc (destination: ^Byte_Buffer, reader: ^SocketReadContext, ending: string) -> bool {
     read_done: bool
     
     for !read_done {
-        when T == SocketReadContext {
-            begin_socket_read(reader)
-        }
+        if !reader_receive(reader) do return false
         
         copy: for buffer_can_read(&reader.buffer) {
-            it := buffer_read_value(&reader.buffer, u8)
+            it := buffer_read(&reader.buffer, u8)
+            
+            buffer_write(destination, it)
+            if ends_with(buffer_peek_all_string(destination), ending) {
+                read_done = true
+                break copy
+            }
+        }
+    }
+    
+    return true
+}
+read_until_string :: proc (destination: ^Byte_Buffer, reader: ^StringReadContext, ending: string) -> bool {
+    read_done: bool
+    
+    for !read_done {
+        copy: for buffer_can_read(&reader.buffer) {
+            it := buffer_read(&reader.buffer, u8)
             
             buffer_write(destination, it)
             if ends_with(buffer_peek_all_string(destination), ending) {
@@ -66,45 +79,40 @@ read_until :: proc (reader: ^$T, destination: ^Byte_Buffer, ending: string) -> b
             }
         }
         
-        when T == SocketReadContext {
-            if !end_socket_read(reader) do return false
-        } else {
-            if !buffer_can_read(&reader.buffer) do return true
-        }
+        if !buffer_can_read(&reader.buffer) do return true
     }
     
     return true
 }
 
-read_count :: proc (reader: ^$T, destination: ^Byte_Buffer, count: int) -> bool {
-    read_done: bool
-    
-    for !read_done {
-        when T == SocketReadContext {
-            begin_socket_read(reader, count)
-        }
+read_count :: proc { read_count_string, read_count_socket }
+read_count_socket :: proc (destination: ^Byte_Buffer, reader: ^SocketReadContext, count: int) -> bool {
+    remaining := count
+    for remaining != 0 {
+        if !reader_receive(reader) do return false
         
-        // @todo(viktor): handle this nicer in the loop
-        if count == 0 {
-            read_done = true
-        } else {
-            start := destination.write_cursor
-            copy: for buffer_can_read(&reader.buffer) {
-                it := buffer_read(&reader.buffer, u8)^
-                
-                buffer_write(destination, it)
-                if destination.write_cursor - start == count {
-                    read_done = true
-                    break copy
-                }
-            }
-        }
+        read_available  := buffer_read_available(&reader.buffer)
+        write_available := buffer_write_available(destination)
+        // @todo(viktor): do this check elsewhere as well
+        if write_available == 0 do return false
+        read_count := min(remaining, read_available, write_available)
+        remaining -= read_count
         
-        when T == SocketReadContext {
-            if !end_socket_read(reader) do return false
-        } else {
-            if !buffer_can_read(&reader.buffer) do return true
-        }
+        buffer_write_buffer_slice(destination, &reader.buffer, read_count)
+    }
+        
+    return true
+}
+read_count_string :: proc (destination: ^Byte_Buffer, reader: ^StringReadContext, count: int) -> bool {
+    remaining := count
+    for remaining != 0 {
+        available  := buffer_read_available(&reader.buffer)
+        read_count := min(remaining, available)
+        remaining -= read_count
+        
+        buffer_write_buffer_slice(destination, &reader.buffer, read_count)
+        
+        if !buffer_can_read(&reader.buffer) do return true
     }
         
     return true
@@ -114,16 +122,14 @@ read_done :: proc(reader: ^$T) -> bool {
     result: bool
     
     when T == SocketReadContext {
-        read: int
-        read, reader.read_error = net.recv_tcp(reader.socket, nil) // Try to read zero bytes to see if the socket is still alive
+        actual_read, read_error := net.recv_tcp(reader.socket, nil) // Try to read zero bytes to see if the socket is still alive
         
-        if !(read == 0 && reader.read_error == nil) {
+        if actual_read != 0 || read_error != nil {
             // @todo(viktor): handle the error
             unimplemented()
         }
     }
     
-    result = reader.buffer.read_cursor == reader.buffer.write_cursor
-    
+    result = !buffer_can_read(&reader.buffer)
     return result
 }

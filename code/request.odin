@@ -64,7 +64,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     
     // Requestline
     if !request.invalid && request.done_upto < .request_line && .request_line <= upto {
-        if read_until(reader, &request.buffer, "\r\n") {
+        if read_until(&request.buffer, reader, "\r\n") {
             request_line := buffer_read_all_string(&request.buffer)
             
             request.method         = chop_until_space(&request_line)
@@ -84,7 +84,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     
     // Headers
     if !request.invalid && request.done_upto < .headers && .headers <= upto {
-        loop: for read_until(reader, &request.buffer, "\r\n") {
+        loop: for read_until(&request.buffer, reader, "\r\n") {
             header_line := buffer_read_all_string(&request.buffer)
             
             if header_line != "\r\n" {
@@ -119,7 +119,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
             reported_content_length, parse_ok = strconv.parse_int(reported_content_length_string)
         }
         
-        if read_count(reader, &request.buffer, reported_content_length) && read_done(reader) {
+        if read_count(&request.buffer, reader, reported_content_length) && read_done(reader) {
             actual_content = buffer_read_all_string(&request.buffer)
             
             if reported_content_length == len(actual_content) {
@@ -237,6 +237,8 @@ is_valid_header_key :: proc (header_key: string)  -> bool {
 }
 
 test_request_parsing :: proc () {
+    fmt.println("Start testing")
+    
     r: Request
     r = request_parse_from_string("GET / HTTP/1.1\r\n\r\n"); assert(!r.invalid)
     
