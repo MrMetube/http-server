@@ -53,18 +53,23 @@ ResponseCode :: enum {
 
 ////////////////////////////////////////////////
 
-// @todo(viktor): separate RequestParser from Request
-// @todo(viktor): The buffer size is hard coded, actually handle the case where the message exceeds the buffer
-request_init :: proc (result: ^Request, allocator: Allocator) {
+make_response :: proc (allocator: Allocator) -> Response {
+    result: Response
     result.allocator = allocator
     result.headers   = make_headers(result.allocator)
     result.buffer    = make_byte_buffer(make([] u8, 4 * Kilobyte, result.allocator))
+    return result
 }
 
-response_init :: proc (result: ^Response, allocator: Allocator) {
+// @todo(viktor): separate RequestParser from Request
+// @todo(viktor): The buffer size is hard coded, actually handle the case where the message exceeds the buffer
+make_request :: proc (allocator: Allocator) -> Request {
+    result: Request
     result.allocator = allocator
     result.headers   = make_headers(result.allocator)
     result.buffer    = make_byte_buffer(make([] u8, 4 * Kilobyte, result.allocator))
+    
+    return result
 }
 
 ////////////////////////////////////////////////
@@ -126,12 +131,11 @@ response_parse_from_socket :: proc (result: ^Response, reader: ^SocketReadContex
 }
 
 // @note(viktor): this is only here for testing
-request_parse_from_string :: proc (data: string) -> Request{
-    result: Request
+request_parse_from_string :: proc (data: string) -> Request {
     reader: StringReadContext
     reader.buffer = make_byte_buffer(to_bytes(data))
     reader.buffer.write_cursor = len(data)
-    request_init(&result, context.temp_allocator)
+    result := make_request(context.temp_allocator)
     
     request_parse(&result, &reader, .request_line)
     request_parse(&result, &reader, .headers)

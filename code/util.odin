@@ -93,7 +93,8 @@ chop_until_string :: proc (data: ^string, ending: string) -> (string, bool) #opt
 ends_with :: proc (s, ending: string) -> bool {
     result: bool
     if len(s) >= len(ending) {
-        result = s[len(s)-len(ending):] == ending
+        end := s[len(s)-len(ending):]
+        result = end == ending
     }
     return result
 }
