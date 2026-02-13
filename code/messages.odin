@@ -54,16 +54,17 @@ ResponseCode :: enum {
 ////////////////////////////////////////////////
 
 // @todo(viktor): separate RequestParser from Request
+// @todo(viktor): The buffer size is hard coded, actually handle the case where the message exceeds the buffer
 request_init :: proc (result: ^Request, allocator: Allocator) {
     result.allocator = allocator
     result.headers   = make_headers(result.allocator)
-    result.buffer    = make_byte_buffer(make([] u8, 1024, result.allocator))
+    result.buffer    = make_byte_buffer(make([] u8, 4 * Kilobyte, result.allocator))
 }
 
 response_init :: proc (result: ^Response, allocator: Allocator) {
     result.allocator = allocator
     result.headers   = make_headers(result.allocator)
-    result.buffer    = make_byte_buffer(make([] u8, 1024, result.allocator))
+    result.buffer    = make_byte_buffer(make([] u8, 4 * Kilobyte, result.allocator))
 }
 
 ////////////////////////////////////////////////
@@ -96,14 +97,22 @@ write_response_line :: proc (sb: ^strings.Builder, code: ResponseCode) {
     fmt.sbprintf(sb, "HTTP/1.1 %v %v\r\n", cast(int) code, reason_phrase)
 }
 
+write_headers_key :: proc (sb: ^strings.Builder, key: string) {
+    fmt.sbprintf(sb, "%v: ", key)
+}
+write_headers_value :: proc (sb: ^strings.Builder, value: string) {
+    fmt.sbprintf(sb, "%v\r\n", value)
+}
 write_headers :: proc (sb: ^strings.Builder, headers: ^Headers) {
     for key, value in headers.internal {
-        fmt.sbprintf(sb, "%v: %v\r\n", key, value)
+        write_headers_key(sb, key)
+        write_headers_value(sb, value)
     }
+    fmt.sbprintf(sb, "\r\n")
 }
 
 write_body :: proc (sb: ^strings.Builder, body: string) {
-    fmt.sbprintf(sb, "\r\n%v", body)
+    fmt.sbprintf(sb, "%v", body)
 }
 
 ////////////////////////////////////////////////

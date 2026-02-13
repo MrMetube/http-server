@@ -26,11 +26,12 @@ socket_reader_make :: proc (client: net.TCP_Socket, buffer: []u8) -> SocketReadC
 reader_receive :: proc (reader: ^SocketReadContext, at_most := max(int)) -> bool {
     ok := true
     if !buffer_can_read(&reader.buffer) {
-        wanted_read := min(len(reader.buffer.bytes), at_most)
+        
+        clear_byte_buffer(&reader.buffer)
+        wanted_read := min(buffer_write_available(&reader.buffer), at_most)
         actual_read, read_error := net.recv_tcp(reader.socket, reader.buffer.bytes[:wanted_read])
         
         reader.buffer.write_cursor = actual_read
-        reader.buffer.read_cursor  = 0
         
         if read_error != nil {
             ok = false

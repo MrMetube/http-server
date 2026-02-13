@@ -4,6 +4,7 @@ package main
 import "core:fmt"
 import os "core:os/os2"
 import "core:mem"
+import "core:crypto/sha2"
 import "core:net"
 import "core:strings"
 import "core:strconv"
@@ -63,58 +64,98 @@ main :: proc () {
                     message := make_request(&httpbin_sb, "GET", route, headers="Host: httpbin.org")
                     if !send(httpbin, message) do os.exit(1)
                     
-                    response.code = .OK
-                    add_default_headers_chunked(&response.headers)
-                    write_response_line(&sb, response.code)
-                    write_headers(&sb, &response.headers)
                     
-                    send_and_reset(client, &sb)
+                    response.code = .OK
+                    write_response_line(&sb, response.code)
                     
                     httpbin_response: Response
                     response_init(&httpbin_response, request_allocator)
                     
-                    httpbin_reader := socket_reader_make(httpbin, make([] u8, 64, request_allocator))
+                    httpbin_reader := socket_reader_make(httpbin, make([] u8, 4*Kilobyte, request_allocator))
                     // @todo(viktor): check that all the fields are actually parsed correctly
                     response_parse_from_socket(&httpbin_response, &httpbin_reader, .headers)
                     assert(!httpbin_response.invalid)
                     
                     fmt.println("httpbin_response", httpbin_response)
                     
-                    send(client, "\r\n")
+                    sha_context: sha2.Context_256
+                    sha2.init_256(&sha_context)
+                    total_count: int
                     
-                    copy_buffer := make_byte_buffer(make([] u8, 256, request_allocator))
-                    for {
-                        if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
-                            // @incomplete handle read error
-                        }
+                    x_content_sha := "x-content-sha256"
+                    x_content_length := "x-content-length"
+                    add_default_headers_chunked(&response.headers)
+                    headers_set_lower(&response.headers, "trailers", x_content_sha)
+                    headers_set_lower(&response.headers, "trailers", x_content_length)
+                    write_headers(&sb, &response.headers)
+                    send_and_reset(client, &sb)
+                    
+                    if content_length, content_lenght_present := headers_get_lower(&httpbin_response.headers, "content-length"); content_lenght_present {
+                        // @note(viktor): sized reading - chunked writing
+                        response_parse(&httpbin_response, &httpbin_reader, .body)
                         
-                        length_string := buffer_read_all_string_and_reset(&copy_buffer)
-                        length_string = trim(length_string)
-                        length, ok := strconv.parse_int(length_string, base = 16)
-                        if !ok {
-                            // @incomplete handle parse error
-                        }
+                        total_count = len(httpbin_response.body)
                         
-                        fmt.sbprintf(&sb, "%x\r\n", length)
-                        send_and_reset(client, &sb)
-                        
-                        // @todo(viktor): this structure is exactly the same as inside read_count. though bool is a pleasent return value, we need to be able to indicate errrors on read AND errors/no space left to write into 
-                        // @correctness, all these reads should be a loop IF and only if the size of the read COULD exceed the copy_buffers size, which is true for these chunks
-                        remaining := length + len("\r\n")
-                        for !read_count(&copy_buffer, &httpbin_reader, remaining) {
-                            // @incomplete handle read error
+                        send_chunk(client, &sb, httpbin_response.body)
+                        send_chunk(client, &sb, "")
+                    } else {
+                        // @note(viktor): chunked reading - chunked writing
+                        copy_buffer := make_byte_buffer(make([] u8, 4 * Kilobyte, request_allocator))
+                        for {
+                            if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
+                                // @incomplete handle read error
+                            }
+                            
+                            length_string := buffer_read_all_string_and_reset(&copy_buffer)
+                            length_string = trim(length_string)
+                            length, ok := strconv.parse_int(length_string, base = 16)
+                            if !ok {
+                                // @incomplete handle parse error
+                            }
+                            
+                            fmt.sbprintf(&sb, "%x\r\n", length)
+                            send_and_reset(client, &sb)
+                            
+                            // @todo(viktor): this structure is exactly the same as inside read_count. though bool is a pleasent return value, we need to be able to indicate errrors on read AND errors/no space left to write into 
+                            // @correctness, all these reads should be a loop IF and only if the size of the read COULD exceed the copy_buffers size, which is true for these chunks
+                            remaining := length + len("\r\n")
+                            for !read_count(&copy_buffer, &httpbin_reader, remaining) {
+                                // @incomplete handle read error
+                                content := buffer_read_all_string_and_reset(&copy_buffer)
+                                
+                                content_length := len(content)-2 // all but the \r\ns
+                                total_count += content_length
+                                sha2.update(&sha_context, to_bytes(content[:content_length]))
+                                send(client, content)
+                                
+                                remaining -= len(content)
+                            }
+                            
                             content := buffer_read_all_string_and_reset(&copy_buffer)
                             send(client, content)
-                            remaining -= len(content)
+                            content_length := len(content)-2 // all but the \r\ns
+                            total_count += content_length
+                            sha2.update(&sha_context, to_bytes(content[:content_length]))
+                            
+                            if length == 0 && content == "\r\n" do break
                         }
-                        
-                        content := buffer_read_all_string_and_reset(&copy_buffer)
-                        send(client, content)
-                        
-                        if length == 0 && content == "\r\n" do break
                     }
                     
-                    send(client, "\r\n")
+                    // @todo(viktor): how do i know that i did it right?
+                    hash: [256] u8
+                    sha2.final(&sha_context, hash[:])
+                    
+                    write_headers_key(&sb, x_content_length)
+                    fmt.sbprintf(&sb, "%v\r\n", total_count)
+                    
+                    write_headers_key(&sb, x_content_sha)
+                    for b in hash {
+                        fmt.sbprintf(&sb, "%02x", b)
+                    }
+                    fmt.sbprintf(&sb, "\r\n")
+                    fmt.sbprintf(&sb, "\r\n")
+                    
+                    send_and_reset(client, &sb)
                     
                     net.close(httpbin)
                     net.close(client)
@@ -152,6 +193,13 @@ respond_and_close :: proc (client: net.TCP_Socket, client_source: net.Endpoint, 
     fmt.printf("Connection closed with %v and source %v\n", client, client_source)
     
     net.close(client)
+}
+
+send_chunk :: proc (client: net.TCP_Socket, sb: ^strings.Builder, message: string) {
+    fmt.sbprintf(sb, "%x\r\n", len(message))
+    send_and_reset(client, sb)
+    send(client, message)
+    send(client, "\r\n")
 }
 
 ////////////////////////////////////////////////
