@@ -28,16 +28,13 @@ build_exe_name :: `build.exe`
 build_dir     :: `.\build\`
 server_dir    :: `..\code`
 client_dir    :: `..\code\client`
-udpsender_dir :: `..\code\udpsender`
 
 run_dir :: `.\data`
 
 server_exe         :: `server.exe`
 client_exe         :: `client.exe`
-udpsender_exe      :: `udpsender.exe`
 server_exe_path    :: `.\`+server_exe
 client_exe_path    :: `.\`+client_exe
-udpsender_exe_path :: `.\`+udpsender_exe
 
 ////////////////////////////////////////////////
 
@@ -83,6 +80,8 @@ main :: proc() {
         }
     }
     
+    procs: Procs
+    
     // @todo(viktor): make .Kill and such also setable from the command line
     if handle_running_exe_gracefully(server_exe, .Kill) {
         build := true
@@ -124,29 +123,7 @@ main :: proc() {
         }
     }
     
-    if handle_running_exe_gracefully(udpsender_exe, .Kill) {
-        build := true
-        if (tasks & {.debugger }) != {} {
-            if !did_change(udpsender_exe_path, udpsender_dir, `.\`) {
-                fmt.println("INFO: No changes detected. Skipping build.")
-                build = false
-            }
-        }
-        
-        if build {
-            odin_build(&cmd, udpsender_dir, udpsender_exe_path)
-            append(&cmd, ..flags)
-            append(&cmd, debug)
-            append(&cmd, optimizations)
-            when Pedantic do append(&cmd, ..pedantic)
-            
-            run_command(&cmd)
-        }
-    }
-    
     fmt.println("INFO: Build done.\n")
-    
-    procs: Procs
     
     if .debugger in tasks {
         fmt.println("INFO: Starting the Rad Debugger.")

@@ -33,11 +33,12 @@ main :: proc () {
                 fmt.printf("Connection accepted by %v with source %v\n", client, client_source)
                 
                 reader := socket_reader_make(client, make([]u8, 8, request_allocator))
+                
                 r: Request
                 request_init(&r, request_allocator)
-                // @todo(viktor): just do upto .request_line and let handler so the rest, or let handler specify this
-                request_parse_from_socket(&r, .body, &reader)
-                fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", r.method, r.request_target, r.http_version, r.headers, r.body)
+                
+                request_parse_from_socket(&r, &reader, .request_line)
+                // fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", r.method, r.request_target, r.http_version, r.headers, r.body)
                 
                 sb := strings.builder_make(request_allocator)
                 
@@ -45,12 +46,15 @@ main :: proc () {
                 response.headers = make_headers(request_allocator)
                 
                 if is_route(r, "/yourproblem") {
+                    request_parse_from_socket(&r, &reader, .body)
                     route_yourproblem(&response)
                     respond_and_close(client, client_source, &sb, &response)
                 } else if is_route(r, "/myproblem") {
+                    request_parse_from_socket(&r, &reader, .body)
                     route_myproblem(&response)
                     respond_and_close(client, client_source, &sb, &response)
                 } else if route_ok, rest := is_route_and_rest(r, "/httpbin"); route_ok {
+                    request_parse_from_socket(&r, &reader, .body)
                     httpbin, dial_ok := dial("httpbin.org:80")
                     if !dial_ok do os.exit(1)
                     
@@ -64,56 +68,47 @@ main :: proc () {
                     write_response_line(&sb, response.code)
                     write_headers(&sb, &response.headers)
                     
-                    send(client, strings.to_string(sb))
+                    send_and_reset(client, &sb)
                     
-                    httpbin_reader := socket_reader_make(httpbin, make([] u8, 256, request_allocator))
-                    copy_buffer := make_byte_buffer(make([] u8, 64, request_allocator))
+                    httpbin_response: Response
+                    response_init(&httpbin_response, request_allocator)
                     
-                    if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
-                        // @incomplete handle read error
-                    }
-                    _ = buffer_read_all_string(&copy_buffer) // response_line
+                    httpbin_reader := socket_reader_make(httpbin, make([] u8, 64, request_allocator))
+                    // @todo(viktor): check that all the fields are actually parsed correctly
+                    response_parse_from_socket(&httpbin_response, &httpbin_reader, .headers)
+                    assert(!httpbin_response.invalid)
                     
-                    for {
-                        buffer_foo(&copy_buffer)
-                        if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
-                            // @incomplete handle read error
-                        }
-                        header := buffer_read_all_string(&copy_buffer)
-                        if header == "\r\n" do break
-                    }
+                    fmt.println("httpbin_response", httpbin_response)
                     
                     send(client, "\r\n")
                     
+                    copy_buffer := make_byte_buffer(make([] u8, 256, request_allocator))
                     for {
-                        buffer_foo(&copy_buffer)
                         if !read_until(&copy_buffer, &httpbin_reader, "\r\n") {
                             // @incomplete handle read error
                         }
-                        length_string := buffer_read_all_string(&copy_buffer)
                         
+                        length_string := buffer_read_all_string_and_reset(&copy_buffer)
                         length_string = trim(length_string)
                         length, ok := strconv.parse_int(length_string, base = 16)
                         if !ok {
                             // @incomplete handle parse error
                         }
                         
-                        re_length_string := fmt.aprintf("%x\r\n", length, allocator = request_allocator)
-                        send(client, re_length_string)
+                        fmt.sbprintf(&sb, "%x\r\n", length)
+                        send_and_reset(client, &sb)
                         
-                        buffer_foo(&copy_buffer)
                         // @todo(viktor): this structure is exactly the same as inside read_count. though bool is a pleasent return value, we need to be able to indicate errrors on read AND errors/no space left to write into 
                         // @correctness, all these reads should be a loop IF and only if the size of the read COULD exceed the copy_buffers size, which is true for these chunks
                         remaining := length + len("\r\n")
                         for !read_count(&copy_buffer, &httpbin_reader, remaining) {
                             // @incomplete handle read error
-                            content := buffer_read_all_string(&copy_buffer)
+                            content := buffer_read_all_string_and_reset(&copy_buffer)
                             send(client, content)
-                            buffer_foo(&copy_buffer)
                             remaining -= len(content)
                         }
                         
-                        content := buffer_read_all_string(&copy_buffer)
+                        content := buffer_read_all_string_and_reset(&copy_buffer)
                         send(client, content)
                         
                         if length == 0 && content == "\r\n" do break
@@ -126,6 +121,7 @@ main :: proc () {
                     
                     fmt.printf("Connection closed with %v and source %v\n", client, client_source)
                 } else {
+                    request_parse_from_socket(&r, &reader, .body)
                     route_any(&response)
                     respond_and_close(client, client_source, &sb, &response)
                 }
@@ -145,11 +141,11 @@ main :: proc () {
 ////////////////////////////////////////////////
 
 respond_and_close :: proc (client: net.TCP_Socket, client_source: net.Endpoint, sb: ^strings.Builder, response: ^Response) {
-    add_default_headers(&response.headers, len(response.content))
+    add_default_headers(&response.headers, len(response.body))
     
     write_response_line(sb, response.code)
     write_headers(sb, &response.headers)
-    write_body(sb, response.content)
+    write_body(sb, response.body)
     
     send(client, strings.to_string(sb^))
     
@@ -184,8 +180,14 @@ dial :: proc (host_and_port: string) -> (net.TCP_Socket, bool) {
     return socket, true
 }
 
+send_and_reset :: proc (socket: net.TCP_Socket, sb: ^strings.Builder) -> bool {
+    result := send(socket, strings.to_string(sb^))
+    strings.builder_reset(sb)
+    return result
+}
+
 send :: proc (socket: net.TCP_Socket, message: string) -> bool {
-    bytes_written, write_error := net.send_tcp(socket, transmute([] u8) message)
+    bytes_written, write_error := net.send_tcp(socket, to_bytes(message))
     if write_error != nil {
         fmt.printf("Error: failed to write to '%v': %v\n", address_and_port_from_socket(socket), write_error)
         return false
@@ -220,7 +222,7 @@ dial_send_receive_and_close :: proc (host_and_port: string, message: string) {
     read, read_ok := receive(socket, buffer[:])
     if !read_ok do os.exit(1)
     
-    fmt.printf("Received %v bytes from %v:\n%v\n", read, host_and_port, transmute(string) buffer[:read])
+    fmt.printf("Received %v bytes from %v:\n%v\n", read, host_and_port, to_string(buffer[:read]))
     
     net.close(socket)
     fmt.printf("Disconnecting...\n")
@@ -236,7 +238,7 @@ address_and_port_from_socket :: proc (socket: net.TCP_Socket) -> string {
 
 route_yourproblem :: proc (response: ^Response) {
     response.code = .Bad_Request
-    response.content = `
+    response.body = `
 <html>
   <head>
     <title>400 Bad Request</title>
@@ -250,7 +252,7 @@ route_yourproblem :: proc (response: ^Response) {
 }
 route_myproblem :: proc (response: ^Response) {
     response.code = .Internal_Server_Error
-    response.content = `
+    response.body = `
 <html>
   <head>
     <title>500 Internal Server Error</title>
@@ -265,7 +267,7 @@ route_myproblem :: proc (response: ^Response) {
 
 route_any :: proc  (response: ^Response) {
     response.code = .OK
-    response.content = `
+    response.body = `
 <html>
   <head>
     <title>200 OK</title>

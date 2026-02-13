@@ -96,12 +96,23 @@ buffer_read_copy :: proc (b: ^Byte_Buffer, $T: typeid) -> (result: T) {
 }
 
 buffer_read_all :: proc (b: ^Byte_Buffer) -> (result: [] u8) {
-    result = buffer_read_slice(b, b.write_cursor - b.read_cursor)
+    count := buffer_read_available(b)
+    result = buffer_read_slice(b, count)
     return result
 }
 
 buffer_read_all_string :: proc (b: ^Byte_Buffer) -> (result: string) {
-    result = transmute(string) buffer_read_slice(b, b.write_cursor - b.read_cursor)
+    count := buffer_read_available(b)
+    result = transmute(string) buffer_read_slice(b, count)
+    return result
+}
+
+buffer_read_all_string_and_reset :: proc (b: ^Byte_Buffer) -> (result: string) {
+    count := buffer_read_available(b)
+    result = transmute(string) buffer_read_slice(b, count)
+    assert(!buffer_can_read(b))
+    b.write_cursor = 0
+    b.read_cursor  = 0
     return result
 }
 
@@ -133,15 +144,7 @@ buffer_can_read :: proc (b: ^Byte_Buffer) -> (result: bool) { return b.read_curs
 buffer_read_available  :: proc (b: ^Byte_Buffer) -> int { return b.write_cursor - b.read_cursor  }
 buffer_write_available :: proc (b: ^Byte_Buffer) -> int { return len(b.bytes)   - b.write_cursor }
 
-buffer_foo :: proc (b: ^Byte_Buffer) {
-    unread := b.bytes[b.read_cursor:b.write_cursor]
-    copy(b.bytes[0:len(unread)], unread)
-    
-    b.write_cursor -= b.read_cursor
-    b.read_cursor   = 0
-}
-
 clear_byte_buffer :: proc (b: ^Byte_Buffer) {
-    b.read_cursor = 0
+    b.read_cursor  = 0
     b.write_cursor = 0
 }

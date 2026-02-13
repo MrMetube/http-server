@@ -5,7 +5,8 @@ import "core:strings"
 import "core:strconv"
 
 Request :: struct {
-    invalid: bool,
+    invalid:   bool,
+    done_upto: Section,
     
     allocator: Allocator   "fmt:\"-\"",
     buffer:    Byte_Buffer "fmt:\"-\"", // the request data is copied into here
@@ -16,32 +17,103 @@ Request :: struct {
     request_target: string,
     http_version:   string,
     body:           string,
-    
-    done_upto: Request_Section,
 }
 
-Request_Section :: enum u8 { none, request_line, headers, body }
+Section :: enum u8 { 
+    none, 
+    request_line, // @naming is also used by response like the response_line
+    headers, 
+    body,
+}
 
 Headers :: struct {
     internal: map[string] string,
 }
 
-Response ::struct {
-    code:    ResponceCode,
-    headers: Headers,
-    content: string,
+Response :: struct {
+    invalid:   bool,
+    done_upto: Section,
+    
+    allocator: Allocator   "fmt:\"-\"",
+    buffer:    Byte_Buffer "fmt:\"-\"", // the request data is copied into here
+    headers:   Headers,     // header keys are reallocated to ensure lowercase, values are views into the backing buffer
+    
+    // these strings are views into the backing buffer
+    code: ResponseCode,
+    body: string,
+}
+
+ResponseCode :: enum {
+    None                  =   0,
+    OK                    = 200,
+    Bad_Request           = 400,
+    Not_Found             = 404,
+    Internal_Server_Error = 500,
 }
 
 ////////////////////////////////////////////////
 
+// @todo(viktor): separate RequestParser from Request
 request_init :: proc (result: ^Request, allocator: Allocator) {
     result.allocator = allocator
-    result.headers = make_headers(result.allocator)
-    result.buffer = make_byte_buffer(make([] u8, 1024, result.allocator))
+    result.headers   = make_headers(result.allocator)
+    result.buffer    = make_byte_buffer(make([] u8, 1024, result.allocator))
 }
 
-request_parse_from_socket :: proc (result: ^Request, upto: Request_Section, reader: ^SocketReadContext) {
-    request_parse(result, upto, reader)
+response_init :: proc (result: ^Response, allocator: Allocator) {
+    result.allocator = allocator
+    result.headers   = make_headers(result.allocator)
+    result.buffer    = make_byte_buffer(make([] u8, 1024, result.allocator))
+}
+
+////////////////////////////////////////////////
+
+add_default_headers :: proc (headers: ^Headers, content_length: int) {
+    headers_set_lower(headers, "connection", "close")
+    headers_set_lower(headers, "content-type", "text/plain")
+    
+    headers_set_lower(headers, "content-length", fmt.aprintf("%v", content_length, allocator = headers.internal.allocator))
+}
+
+add_default_headers_chunked :: proc (headers: ^Headers) {
+    headers_set_lower(headers, "connection", "close")
+    headers_set_lower(headers, "content-type", "text/plain")
+    
+    headers_set_lower(headers, "transfer-encoding", "chunked")
+}
+
+write_response_line :: proc (sb: ^strings.Builder, code: ResponseCode) {
+    reason_phrase: string
+    switch code {
+    case .None: unreachable()
+    
+    case .OK:                    reason_phrase = "OK"
+    case .Bad_Request:           reason_phrase = "Bad Request"
+    case .Not_Found:             reason_phrase = "Not Found"
+    case .Internal_Server_Error: reason_phrase = "Internal Server Error"
+    }
+    
+    fmt.sbprintf(sb, "HTTP/1.1 %v %v\r\n", cast(int) code, reason_phrase)
+}
+
+write_headers :: proc (sb: ^strings.Builder, headers: ^Headers) {
+    for key, value in headers.internal {
+        fmt.sbprintf(sb, "%v: %v\r\n", key, value)
+    }
+}
+
+write_body :: proc (sb: ^strings.Builder, body: string) {
+    fmt.sbprintf(sb, "\r\n%v", body)
+}
+
+////////////////////////////////////////////////
+
+request_parse_from_socket :: proc (result: ^Request, reader: ^SocketReadContext, upto: Section) {
+    request_parse(result, reader, upto)
+}
+
+response_parse_from_socket :: proc (result: ^Response, reader: ^SocketReadContext, upto: Section) {
+    response_parse(result, reader, upto)
 }
 
 // @note(viktor): this is only here for testing
@@ -52,14 +124,14 @@ request_parse_from_string :: proc (data: string) -> Request{
     reader.buffer.write_cursor = len(data)
     request_init(&result, context.temp_allocator)
     
-    request_parse(&result, .request_line, &reader)
-    request_parse(&result, .headers,      &reader)
-    request_parse(&result, .body,         &reader)
+    request_parse(&result, &reader, .request_line)
+    request_parse(&result, &reader, .headers)
+    request_parse(&result, &reader, .body)
     
     return result
 }
 
-request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
+request_parse :: proc (request: ^Request, reader: ^$T, upto: Section) {
     assert(request.allocator != {}, "Request was not initialized")
     
     // Requestline
@@ -71,8 +143,7 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
             request.request_target = chop_until_space(&request_line)
             request.http_version   = chop_until_space(&request_line)
             
-            // @todo(viktor): validate request_target
-            if is_valid_method(request) && is_valid_http_version(request) {
+            if is_valid_method(request) && is_valid_http_version(request.http_version) {
                  request.done_upto = .request_line
             } else {
                 request.invalid = true
@@ -84,23 +155,8 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     
     // Headers
     if !request.invalid && request.done_upto < .headers && .headers <= upto {
-        loop: for read_until(&request.buffer, reader, "\r\n") {
-            header_line := buffer_read_all_string(&request.buffer)
-            
-            if header_line != "\r\n" {
-                header_line = trim(header_line)
-                
-                key := chop_until(&header_line, ':')
-                if is_valid_header_key(key) {
-                    value := trim(header_line)
-                    headers_set(&request.headers, key, value, request.allocator)
-                } else {
-                    request.invalid = true
-                    break loop
-                }
-            } else {
-                break loop
-            }
+        if !parse_headers(&request.buffer, reader, &request.headers) {
+            request.invalid = true
         }
         
         request.done_upto = .headers
@@ -108,19 +164,10 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     
     // Body
     if !request.invalid && request.done_upto < .body && .body <= upto {
-        // @todo(viktor): helper header_get_int?
-        reported_content_length_string, exists := headers_get_lower(&request.headers, "content-length")
-        reported_content_length: int
-        
-        content_ok: bool
-        actual_content: string
-        if exists {
-            parse_ok: bool
-            reported_content_length, parse_ok = strconv.parse_int(reported_content_length_string)
-        }
+        reported_content_length := headers_get_int(&request.headers, "content-length") or_else 0
         
         if read_count(&request.buffer, reader, reported_content_length) && read_done(reader) {
-            actual_content = buffer_read_all_string(&request.buffer)
+            actual_content := buffer_read_all_string(&request.buffer)
             
             if reported_content_length == len(actual_content) {
                 request.body = actual_content
@@ -137,8 +184,89 @@ request_parse :: proc (request: ^Request, upto: Request_Section, reader: ^$T) {
     // @todo(viktor): trailers
 }
 
+response_parse :: proc (response: ^Response, reader: ^$T, upto: Section) {
+    assert(response.allocator != {}, "Response was not initialized")
+    
+    // Requestline
+    if !response.invalid && response.done_upto < .request_line && .request_line <= upto {
+        if read_until(&response.buffer, reader, "\r\n") {
+            request_line := buffer_read_all_string(&response.buffer)
+            
+            http_version := chop_until_space(&request_line) // @todo(viktor): store this maybe?
+            code_string  := chop_until_space(&request_line)
+            reason       := chop_until_space(&request_line)
+            
+            code, parse_ok := strconv.parse_int(code_string)
+            
+            if is_valid_response_code(code) && is_valid_http_version(http_version) {
+                 response.done_upto = .request_line
+            } else {
+                response.invalid = true
+            }
+        } else {
+            response.invalid = true
+        }
+    }
+    
+    // Headers
+    if !response.invalid && response.done_upto < .headers && .headers <= upto {
+        if !parse_headers(&response.buffer, reader, &response.headers) {
+            response.invalid = true
+        }
+        
+        response.done_upto = .headers
+    }
+    
+    // Body
+    if !response.invalid && response.done_upto < .body && .body <= upto {
+        reported_content_length := headers_get_int(&response.headers, "content-length") or_else 0
+        
+        if read_count(&response.buffer, reader, reported_content_length) && read_done(reader) {
+            actual_content := buffer_read_all_string(&response.buffer)
+            
+            if reported_content_length == len(actual_content) {
+                response.body = actual_content
+            } else {
+                response.invalid = true
+            }
+        } else {
+            response.invalid = true
+        }
+        
+        response.done_upto = .body
+    }
+    
+    // @todo(viktor): trailers
+}
+
 ////////////////////////////////////////////////
 
+parse_headers :: proc (buffer: ^Byte_Buffer, reader: ^$T, headers: ^Headers) -> bool {
+    ok := true
+    loop: for read_until(buffer, reader, "\r\n") {
+        header_line := buffer_read_all_string(buffer)
+        
+        if header_line != "\r\n" {
+            header_line = trim(header_line)
+            
+            key := chop_until(&header_line, ':')
+            if is_valid_header_key(key) {
+                value := trim(header_line)
+                headers_set(headers, key, value)
+            } else {
+                ok = false
+                break loop
+            }
+        } else {
+            break loop
+        }
+    }
+    
+    return ok
+}
+
+////////////////////////////////////////////////
+// @todo(viktor): should regular fields like content-length always be stored as int and easily accessed? or does that not matter, because its too rare?
 make_headers :: proc (allocator: Allocator) -> Headers {
     result := Headers {
         make(map[string] string, allocator)
@@ -147,12 +275,12 @@ make_headers :: proc (allocator: Allocator) -> Headers {
 }
 
 // @todo(viktor): both set and get also check for a valid key?
-headers_set :: proc (headers: ^Headers, key, value: string, allocator: Allocator) {
-    key_lower := strings.to_lower(key, allocator)
+headers_set :: proc (headers: ^Headers, key, value: string) {
+    key_lower := strings.to_lower(key, headers.internal.allocator)
     headers_set_lower(headers, key_lower, value)
 }
-headers_get :: proc (headers: ^Headers, key: string, allocator: Allocator) -> (string, bool) #optional_ok {
-    key_lower := strings.to_lower(key, allocator)
+headers_get :: proc (headers: ^Headers, key: string) -> (string, bool) #optional_ok {
+    key_lower := strings.to_lower(key, headers.internal.allocator)
     result, ok := headers_get_lower(headers, key_lower)
     return result, ok
 }
@@ -177,13 +305,29 @@ headers_get_lower :: proc (headers: ^Headers, key_lower: string) -> (string, boo
 
 ////////////////////////////////////////////////
 
+headers_get_int :: proc (headers: ^Headers, key: string) -> (int, bool) #optional_ok {
+    value, ok := headers_get(headers, key)
+    if !ok do return 0, ok
+    
+    result: int
+    result, ok = strconv.parse_int(value)
+    return result, ok
+}
+
+////////////////////////////////////////////////
+
 is_valid_method :: proc (request: ^Request) -> bool {
     result := request.method == "GET" || request.method == "POST"
     return result
 }
 
-is_valid_http_version :: proc (request: ^Request) -> bool {
-    version := request.http_version
+is_valid_response_code :: proc (code: int) -> bool {
+    // @todo(viktor): implement this
+    return true
+}
+
+is_valid_http_version :: proc (http_version: string) -> bool {
+    version := http_version
     http := chop_until(&version, '/')
     
     result: bool
