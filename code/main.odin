@@ -54,6 +54,27 @@ main :: proc () {
                     request_parse_from_socket(&r, &reader, .body)
                     route_myproblem(&response)
                     respond_and_close(client, client_source, &sb, &response)
+                } else if is_route(r, "./data/video") {
+                    request_parse_from_socket(&r, &reader, .body)
+                    
+                    video, err := os.read_entire_file("./data/vim.mp4", request_allocator)
+                    assert(err == nil)
+                    
+                    add_default_headers(&response.headers, len(video))
+                    headers_set_lower(&response.headers, "content-type", "video/mp4")
+                    
+                    response.code = .OK
+                    response.body = to_string(video)
+                    
+                    write_response_line(&sb, response.code)
+                    write_headers(&sb, &response.headers)
+                    write_body(&sb, response.body)
+                    
+                    send(client, strings.to_string(sb))
+                    
+                    fmt.printf("Connection closed with %v and source %v\n", client, client_source)
+                    
+                    net.close(client)
                 } else if route_ok, rest := is_route_and_rest(r, "/httpbin"); route_ok {
                     request_parse_from_socket(&r, &reader, .body)
                     httpbin, dial_ok := dial("httpbin.org:80")
@@ -167,7 +188,7 @@ main :: proc () {
                     respond_and_close(client, client_source, &sb, &response)
                 }
                 
-                test_request_parsing()
+                // test_request_parsing()
                 
             } else {
                 end, _ := net.bound_endpoint(server.socket)
