@@ -5,7 +5,7 @@ import "core:net"
 
 SocketReadContext :: struct  {
     buffer: Byte_Buffer,
-    socket: net.TCP_Socket,
+    socket: ^Socket,
 }
 
 StringReadContext :: struct {
@@ -13,7 +13,7 @@ StringReadContext :: struct {
     source: string,
 }
 
-socket_reader_make :: proc (client: net.TCP_Socket, buffer: []u8) -> SocketReadContext {
+socket_reader_make :: proc (client: ^Socket, buffer: []u8) -> SocketReadContext {
     result: SocketReadContext
     result.buffer = make_byte_buffer(buffer)
     result.socket = client
@@ -29,13 +29,12 @@ reader_receive :: proc (reader: ^SocketReadContext, at_most := max(int)) -> bool
         
         clear_byte_buffer(&reader.buffer)
         wanted_read := min(buffer_write_available(&reader.buffer), at_most)
-        actual_read, read_error := net.recv_tcp(reader.socket, reader.buffer.bytes[:wanted_read])
         
-        reader.buffer.write_cursor = actual_read
-        
-        if read_error != nil {
+        actual_read, read_ok := receive(reader.socket, reader.buffer.bytes[:wanted_read])
+        if !read_ok {
             ok = false
-            fmt.printf("ERROR: Could not read from socket '%v': %v\n", address_and_port_from_socket(reader.socket), read_error)
+        } else {
+            reader.buffer.write_cursor = actual_read
         }
     }
     
@@ -123,9 +122,10 @@ read_done :: proc(reader: ^$T) -> bool {
     result: bool
     
     when T == SocketReadContext {
-        actual_read, read_error := net.recv_tcp(reader.socket, nil) // Try to read zero bytes to see if the socket is still alive
+        // Try to read zero bytes to see if the socket is still alive
+        actual_read, ok := receive(reader.socket, nil)
         
-        if actual_read != 0 || read_error != nil {
+        if actual_read != 0 || !ok {
             // @todo(viktor): handle the error
             unimplemented()
         }

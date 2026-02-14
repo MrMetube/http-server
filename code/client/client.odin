@@ -1,6 +1,7 @@
 package client
 
 import "core:strings"
+import os "core:os/os2"
 
 import code ".."
 
@@ -14,11 +15,11 @@ once :: proc (kind: int) {
     sb: strings.Builder
     message: string
     switch kind {
-    case 0: message = code.make_request(&sb, "GET", "/", "Hello World")
-    case 1: message = code.make_request(&sb, "GET", "/yourproblem", "w")
-    case 2: message = code.make_request(&sb, "GET", "/myproblem")
-    case 3: message = code.make_request(&sb, "GET", "localhost:402069/httpbin/stream/100")
+    case 0: message = code.write_request(&sb, "GET", "/", "Hello World")
+    case 1: message = code.write_request(&sb, "GET", "/yourproblem", "w")
+    case 2: message = code.write_request(&sb, "GET", "/myproblem")
+    case 3: message = code.write_request(&sb, "GET", "localhost:402069/httpbin/stream/100")
     }
     
-    code.dial_send_receive_and_close(host_and_port, message)
+    if !code.dial_send_receive_and_close(host_and_port, message) do os.exit(1)
 }
