@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:strings"
 
-Socket :: struct #all_or_none {
+Socket :: struct {
     valid: bool,
 
     socket:   net.TCP_Socket,
@@ -14,9 +14,10 @@ Socket :: struct #all_or_none {
 ////////////////////////////////////////////////
 
 dial :: proc (host_and_port: string) -> Socket {
+    // @waste
     socket, connect_error := net.dial_tcp_from_hostname_and_port_string(host_and_port)
+    endpoint, _ := net.bound_endpoint(socket) 
     
-    endpoint, _ := net.bound_endpoint(socket) // @waste
     result := Socket {
         valid = true,
         

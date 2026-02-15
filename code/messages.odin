@@ -288,9 +288,9 @@ make_headers :: proc (allocator: Allocator) -> Headers {
 }
 
 // @todo(viktor): both set and get also check for a valid key?
-headers_set :: proc (headers: ^Headers, key, value: string) {
+headers_set :: proc (headers: ^Headers, key, value: string, replace := false) {
     key_lower := strings.to_lower(key, headers.internal.allocator)
-    headers_set_lower(headers, key_lower, value)
+    headers_set_lower(headers, key_lower, value, replace = replace)
 }
 headers_get :: proc (headers: ^Headers, key: string) -> (string, bool) #optional_ok {
     key_lower := strings.to_lower(key, headers.internal.allocator)
@@ -299,10 +299,15 @@ headers_get :: proc (headers: ^Headers, key: string) -> (string, bool) #optional
 }
 
 // @todo(viktor): both set and get internal only, assert that its lower and valid
-headers_set_lower :: proc (headers: ^Headers, key_lower, value: string) {
+headers_set_lower :: proc (headers: ^Headers, key_lower, value: string, replace := false) {
     _, value_pointer, just_inserted, _ := map_entry(&headers.internal, key_lower)
     if !just_inserted {
-        new_value, _ := strings.concatenate({value_pointer^, ", ", value}, context.allocator)
+        new_value: string
+        if replace {
+            new_value = value
+        } else {
+            new_value, _ = strings.concatenate({value_pointer^, ", ", value}, context.allocator)
+        }
         value_pointer^ = new_value
     } else {
         value_pointer^ = value

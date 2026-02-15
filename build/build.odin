@@ -14,7 +14,8 @@ Pedantic      :: false
 
 debug    :: `-debug`
 
-flags    := [] string {`-vet-cast`,`-vet-shadowing`,`-microarch:native`,`-target:windows_amd64`}
+flags    := [] string {`-vet-cast`,`-vet-shadowing`,}
+native   := [] string {`-microarch:native`, `-target:windows_amd64`}
 pedantic := [] string {
     `-vet-unused`, `-vet-unused-imports`,`-vet-semicolon`,`-vet-unused-variables`,`-vet-style`,
     `-vet-packages:main`,`-vet-unused-procedures`
@@ -27,12 +28,14 @@ build_exe_name :: `build.exe`
 
 build_dir     :: `.\build\`
 server_dir    :: `..\code`
+wasm_dir      :: `..\code\wasm`
 client_dir    :: `..\code\client`
 
 run_dir :: `.\data`
 
 server_exe         :: `server.exe`
 client_exe         :: `client.exe`
+wasm_out           :: `..\data\out.wasm`
 server_exe_path    :: `.\`+server_exe
 client_exe_path    :: `.\`+client_exe
 
@@ -95,6 +98,7 @@ main :: proc() {
         if build {
             odin_build(&cmd, server_dir, server_exe_path)
             append(&cmd, ..flags)
+            append(&cmd, ..native)
             append(&cmd, debug)
             append(&cmd, optimizations)
             when Pedantic do append(&cmd, ..pedantic)
@@ -113,7 +117,30 @@ main :: proc() {
         }
         
         if build {
+            err := os2.copy_file(`..\data\odin.js`, ODIN_ROOT+`\core\sys\wasm\js\odin.js`)
+            assert(err == nil)
+            
             odin_build(&cmd, client_dir, client_exe_path)
+            append(&cmd, ..flags)
+            append(&cmd, ..native)
+            append(&cmd, debug)
+            append(&cmd, optimizations)
+            when Pedantic do append(&cmd, ..pedantic)
+            
+            run_command(&cmd)
+        }
+    }
+    
+    {
+        build := true
+        // if !did_change(wasm_path, wasm_dir, `.\`) {
+        //     fmt.println("INFO: No changes detected. Skipping build.")
+        //     build = false
+        // }
+        
+        if build {
+            odin_build(&cmd, wasm_dir, wasm_out)
+            append(&cmd, "-target:js_wasm32")
             append(&cmd, ..flags)
             append(&cmd, debug)
             append(&cmd, optimizations)

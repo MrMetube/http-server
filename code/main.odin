@@ -9,7 +9,119 @@ import "core:net"
 import "core:strings"
 import "core:strconv"
 
+Request_Context :: struct {
+    client: Socket, 
+    sb: strings.Builder, 
+    response: Response,
+    allocator: Allocator,
+}
+
 main :: proc () {
+    server := begin_server("localhost:6969")
+    defer end_server(&server)
+    if !server.valid do os.exit(1)
+    
+    request_backing := make([] u8, 1 * Gigabyte, context.allocator)
+    request_arena: mem.Arena
+    mem.arena_init(&request_arena, request_backing)
+    request_allocator := mem.arena_allocator(&request_arena)
+    
+    
+    for {
+        free_all(request_allocator)
+        
+        _client := accept(server)
+        client := &_client
+        if !client.valid do continue
+        
+        reader := socket_reader_make(client, make([]u8, 8, request_allocator))
+        
+        request := make_request(request_allocator)
+        
+        request_parse_from_socket(&request, &reader, .request_line)
+        fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", request.method, request.request_target, request.http_version, request.headers, request.body)
+        
+        
+        ctx:= Request_Context {
+            client = _client,
+            sb = strings.builder_make(request_allocator),
+            response = make_response(request_allocator),
+            allocator = request_allocator,
+        }
+        
+        sb := &ctx.sb
+        
+        send_file :: proc (request: ^Request_Context, path: string, content_type: string) {
+            // @todo(viktor): ensure that the path is checked before by the caller
+            
+            response := &request.response
+            
+            data, err := os.read_entire_file(path, request.allocator)
+            if err != nil {
+                response.code = .Internal_Server_Error
+            } else {
+                response.code = .OK 
+                response.body = to_string(data)
+            }
+            
+            add_default_headers(&response.headers, len(response.body))
+            headers_set_lower(&response.headers, "content-type", content_type, replace = true)
+            
+            sb := &request.sb
+            write_response_line(sb, response.code)
+            write_headers(sb, &response.headers)
+            write_body(sb, response.body)
+            
+            send_and_reset(&request.client, sb)
+            
+            fmt.printf("Connection closed with %v\n", request.client)
+            
+            close(&request.client)
+        }
+        
+        if is_route(request, "/") {
+            request_parse_from_socket(&request, &reader, .body)
+            
+            send_file(&ctx, "./index.html", "text/html")
+            close(client)
+        } else if is_route(request, "odin.js") {
+            request_parse_from_socket(&request, &reader, .body)
+            
+            send_file(&ctx, "./odin.js", "text/javascript")
+            close(client)
+        } else if is_route(request, "out.wasm") {
+            request_parse_from_socket(&request, &reader, .body)
+            
+            send_file(&ctx, "./out.wasm", "application/wasm")
+            close(client)
+        } else {
+            respond_with_404(client, &ctx.response, sb, request_allocator)
+        }
+    }
+}
+
+respond_with_404 :: proc (client: ^Socket, response: ^Response, sb: ^strings.Builder, request_allocator: Allocator) {
+    data_404, err := os.read_entire_file("./404.html", request_allocator)
+    assert(err == nil)
+    response.code = .Not_Found
+    response.body = to_string(data_404)
+    
+    add_default_headers(&response.headers, len(response.body))
+    headers_set_lower(&response.headers, "content-type", "text/html", replace = true)
+    write_response_line(sb, response.code)
+    write_headers(sb, &response.headers)
+    write_body(sb, response.body)
+    
+    send_and_reset(client, sb)
+    
+    fmt.printf("404: Connection closed with %v\n", client)
+    
+    close(client)
+}
+
+////////////////////////////////////////////////
+
+http_protocol_from_scratch :: proc () {
     test_request_parsing()
     
     server := begin_server("localhost:42069")
