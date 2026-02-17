@@ -117,9 +117,6 @@ main :: proc() {
         }
         
         if build {
-            err := os2.copy_file(`..\data\odin.js`, ODIN_ROOT+`\core\sys\wasm\js\odin.js`)
-            assert(err == nil)
-            
             odin_build(&cmd, client_dir, client_exe_path)
             append(&cmd, ..flags)
             append(&cmd, ..native)
@@ -139,6 +136,9 @@ main :: proc() {
         // }
         
         if build {
+            err := os2.copy_file(`..\data\odin.js`, ODIN_ROOT+`\core\sys\wasm\js\odin.js`)
+            assert(err == nil)
+            
             odin_build(&cmd, wasm_dir, wasm_out)
             append(&cmd, "-target:js_wasm32")
             append(&cmd, ..flags)

@@ -32,7 +32,7 @@ dial :: proc (host_and_port: string) -> Socket {
     return result
 }
 
-accept :: proc (server: Socket) -> Socket {
+accept :: proc (server: ^Socket) -> Socket {
     if !server.valid do return {}
     
     client, endpoint, accept_error := net.accept_tcp(server.socket)
@@ -45,7 +45,8 @@ accept :: proc (server: Socket) -> Socket {
     }
     
     if accept_error != nil {
-        error_and_close(&result, "Error: failed to accept a client tcp on '%v': %v\n", address_and_port_from_socket(server), accept_error)
+        // @todo(viktor): should we also close the server?
+        error_and_close(&result, "Error: failed to accept a client tcp on '%v': %v\n", address_and_port_from_socket(server^), accept_error)
     }
     
     return result
@@ -96,7 +97,7 @@ receive :: proc (socket: ^Socket, buffer: [] u8) -> (int, bool) {
 
 close :: proc (socket: ^Socket) {
     net.close(socket.socket)
-    socket.valid = false
+    socket^ = {}
 }
 
 ////////////////////////////////////////////////

@@ -8,6 +8,8 @@ import "core:crypto/sha2"
 import "core:net"
 import "core:strings"
 import "core:strconv"
+import "core:thread"
+import "core:time"
 
 Request_Context :: struct {
     client: Socket, 
@@ -16,34 +18,105 @@ Request_Context :: struct {
     allocator: Allocator,
 }
 
+thread_count : i64 : 3
+server_lane :: thread_count-1
 main :: proc () {
-    server := begin_server("localhost:6969")
-    defer end_server(&server)
-    if !server.valid do os.exit(1)
+    thread_context_init(thread_count)
     
-    request_backing := make([] u8, 1 * Gigabyte, context.allocator)
+    for thread_index in 1..<thread_count {
+        thread.create_and_start_with_poly_data(thread_index, thread_main, context)
+    }
+    thread_main(0)
+}
+
+global_server: Socket
+server_mutex: TicketMutex
+clients: [7] Socket
+next_entry_to_write: int
+next_entry_to_read:  int
+
+total_accepted_handler: int
+total_accepted_server: int
+
+thread_main :: proc (init_thread_index: i64) {
+    thread_init(init_thread_index)
+    
+    if lane_index() == server_lane {
+        global_server = begin_server("localhost:6969")
+        lane_sync_value(&global_server, server_lane)
+        server := &global_server
+        
+        defer end_server(server)
+        if !server.valid do os.exit(1)
+        
+        for {
+            client := accept(server)
+            
+            old_next_entry := next_entry_to_write
+            new_next_entry := (old_next_entry + 1) % len(clients)
+            // @note(viktor): We cannot accept more clients, we have to wait for the other threads to finish work
+            if next_entry_to_read == new_next_entry {
+                // fmt.println("Server needs to wait")
+                for next_entry_to_read == new_next_entry {
+                    spin_hint()
+                }
+                // fmt.println("Server done waiting")
+            }
+            
+            entry := &clients[old_next_entry]
+            entry^ = client
+            
+            ok, _ := atomic_compare_exchange(&next_entry_to_write, old_next_entry, new_next_entry)
+            assert(ok)
+            
+            atomic_add(&total_accepted_server, 1)
+            // fmt.printf("Server: %v\n", total_accepted_server)
+            display()
+        }
+        
+        return
+    }
+    
+    server: Socket
+    lane_sync_value(&server, server_lane)
+    
+    request_backing := make([] u8, 3 * Gigabyte, context.allocator)
     request_arena: mem.Arena
     mem.arena_init(&request_arena, request_backing)
     request_allocator := mem.arena_allocator(&request_arena)
     
-    
+    waiting: bool
     for {
         free_all(request_allocator)
         
-        _client := accept(server)
-        client := &_client
+        client := accept_thread(&server)
+        if client == nil {
+            if !waiting {
+                waiting = true
+                // fmt.printf("Handler %v needs to wait\n", lane_index())
+            }
+            time.sleep(10 * time.Millisecond)
+            continue
+        }
         if !client.valid do continue
+        waiting = false
+        // fmt.printf("Handler %v done waiting\n", lane_index())
+        
+        
+        atomic_add(&total_accepted_handler, 1)
+        // fmt.printf("Handler: %v\n", total_accepted_handler)
+        display()
         
         reader := socket_reader_make(client, make([]u8, 8, request_allocator))
         
         request := make_request(request_allocator)
         
         request_parse_from_socket(&request, &reader, .request_line)
-        fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", request.method, request.request_target, request.http_version, request.headers, request.body)
+        // fmt.printf("Received:\n%v %v %v\n%v\n\n%v\n", request.method, request.request_target, request.http_version, request.headers, request.body)
         
         
         ctx:= Request_Context {
-            client = _client,
+            client = client^,
             sb = strings.builder_make(request_allocator),
             response = make_response(request_allocator),
             allocator = request_allocator,
@@ -59,6 +132,7 @@ main :: proc () {
             data, err := os.read_entire_file(path, request.allocator)
             if err != nil {
                 response.code = .Internal_Server_Error
+                fmt.println("Error loading file", os.error_string(err))
             } else {
                 response.code = .OK 
                 response.body = to_string(data)
@@ -74,35 +148,149 @@ main :: proc () {
             
             send_and_reset(&request.client, sb)
             
-            fmt.printf("Connection closed with %v\n", request.client)
-            
             close(&request.client)
         }
+        fmt.println("target:", request.request_target)
         
-        if is_route(request, "/") {
-            request_parse_from_socket(&request, &reader, .body)
+        files, err := os.read_directory_by_path(".", 0, request_allocator)
+        
+        
+        if false {
+            // @note(viktor): just allow access to all in the root
             
-            send_file(&ctx, "./index.html", "text/html")
-            close(client)
-        } else if is_route(request, "odin.js") {
-            request_parse_from_socket(&request, &reader, .body)
-            
-            send_file(&ctx, "./odin.js", "text/javascript")
-            close(client)
-        } else if is_route(request, "out.wasm") {
-            request_parse_from_socket(&request, &reader, .body)
-            
-            send_file(&ctx, "./out.wasm", "application/wasm")
-            close(client)
-        } else {
-            respond_with_404(client, &ctx.response, sb, request_allocator)
+            if is_route(request, "/") {
+                request_parse_from_socket(&request, &reader, .body)
+                
+                index_sb := strings.builder_make(request_allocator)
+                for file in files {
+                    path, path_err := os.get_relative_path(".", file.fullpath, request_allocator)
+                    if path_err != nil do continue
+                    if strings.starts_with(file.name, ".") do continue
+                    fmt.sbprintf(&index_sb, `<li><a href="%v">%v</a></li>`, path, file.name)
+                }
+                
+                request := ctx
+                response := &ctx.response
+                response.code = .OK
+                response.body = fmt.aprintf(`
+    <html>
+        <head>
+            <title>Index</title>
+        </head>
+        <body>
+            <ul>
+                %v
+            </ul>
+        </body>
+    </html>
+    `, strings.to_string(index_sb), allocator = request_allocator)
+                
+                add_default_headers(&response.headers, len(response.body))
+                headers_set_lower(&response.headers, "content-type", "text/html", replace = true)
+                
+                // sb := &request.sb
+                write_response_line(sb, response.code)
+                write_headers(sb, &response.headers)
+                write_body(sb, response.body)
+                
+                send_and_reset(&request.client, sb)
+                
+                close(&request.client)
+                close(client)
+        }} else {
+            if false {
+                // @note(viktor): just allow access to all in the root
+                // @todo(viktor): do i even want this?
+                // @todo(viktor): how do i get the mimetype of a file dynamically?
+                for file in files {
+                    path, path_err := os.get_relative_path(".", file.fullpath, request_allocator)
+                    if path_err != nil do continue
+                    fmt.println(path)
+                    if is_route(request, fmt.aprintf("/%v", path, allocator = request_allocator)) {
+                        request_parse_from_socket(&request, &reader, .body)
+                        send_file(&ctx, path, "text/plain")
+                    }
+                }
+            }
+            if is_route(request, "/404") {
+                request_parse_from_socket(&request, &reader, .body)
+                
+                respond_with_404(client, &ctx.response, &ctx.sb, request_allocator)
+                close(client)
+            } else if is_route(request, "/odin.js") {
+                request_parse_from_socket(&request, &reader, .body)
+                
+                send_file(&ctx, "./odin.js", "text/javascript")
+                close(client)
+            } else if is_route(request, "/big.bin") {
+                request_parse_from_socket(&request, &reader, .body)
+                
+                fmt.println("HERE")
+                send_file(&ctx, "./big.bin", "application/octet-stream")
+                close(client)
+            } else if is_route(request, "/out.wasm") {
+                request_parse_from_socket(&request, &reader, .body)
+                
+                send_file(&ctx, "./out.wasm", "application/wasm")
+                close(client)
+            } else {
+                respond_with_404(client, &ctx.response, sb, request_allocator)
+            }
         }
     }
 }
+display_ticket: TicketMutex
+display :: proc () {
+    
+    read := next_entry_to_read
+    write := next_entry_to_write
+    
+    state: [len(clients)] int
+    end := read < write ? write : write + len(clients)
+    if read != write {
+        for i in read ..< end {
+            index := i % len(clients)
+            state[index] = 1
+            if !clients[index].valid do state[index] = 2
+        }
+    }
+    
+    begin_ticket_mutex(&display_ticket)
+    fmt.print(" ")
+    for i in 0..<len(clients) {
+        if i == read && i == write do fmt.print("B")
+        else if i == read do fmt.print("R")
+        else if i == write do fmt.print("W")
+        else do fmt.print(" ")
+    }
+    fmt.print("\n")
+    fmt.print("[")
+    for i in 0..<len(clients) {
+        fmt.print(state[i] == 0 ? " " : (state[i] == 1 ? "x" : "."))
+    }
+    fmt.print("]\n")
+    end_ticket_mutex(&display_ticket)
+}
+
+accept_thread :: proc (server: ^Socket) -> ^Socket {
+    old_next_entry := next_entry_to_read
+    
+    result: ^Socket
+    if old_next_entry != next_entry_to_write {
+        new_next_entry := (old_next_entry + 1) % len(clients)
+        ok, index := atomic_compare_exchange(&next_entry_to_read, old_next_entry, new_next_entry)
+        
+        if ok {
+            result = &clients[index]
+        }
+    }
+    
+    return result
+}
 
 respond_with_404 :: proc (client: ^Socket, response: ^Response, sb: ^strings.Builder, request_allocator: Allocator) {
-    data_404, err := os.read_entire_file("./404.html", request_allocator)
-    assert(err == nil)
+    data_404 := #load("../data/404.html")
+    
     response.code = .Not_Found
     response.body = to_string(data_404)
     
@@ -139,7 +327,7 @@ http_protocol_from_scratch :: proc () {
         
         // @todo(viktor): handle multiple connections
         // have the server allow multiple threads to handle an accepted client. so a pull client instead of the server-thread pushing into threads
-        client := accept(server)
+        client := accept(&server)
         if !client.valid do continue
         
         fmt.printf("Connection accepted by %v\n", client)
@@ -391,17 +579,21 @@ route_any :: proc  (response: ^Response) {
 ////////////////////////////////////////////////
 
 begin_server :: proc (host_colon_port: string) -> Socket {
-    
+    result: Socket
+    init_server(&result, host_colon_port)
+    return result
+}
+
+init_server :: proc (server: ^Socket, host_colon_port: string) {
     endpoint, resolve_error := net.resolve_ip4(host_colon_port)
     
     if resolve_error != nil {
         fmt.printf("Error: failed to resolve endpoint '%v': %v\n", host_colon_port, resolve_error)
-        return {}
+        return
     }
     
-    result := listen(endpoint)
+    server^ = listen(endpoint)
     fmt.printf("Start listening on %v\n", host_colon_port)
-    return result
 }
 
 end_server :: proc (server: ^Socket) {
